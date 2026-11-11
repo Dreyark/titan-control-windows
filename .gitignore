@@ -20,3 +20,12 @@ __pycache__/
 
 # Release archives built by scripts/make_tarball.sh
 /dist/
+
+# Stand-alone probe build output
+/tools/ddc_probe/target/
+
+# Register scans and probe results (local)
+/tools/ddc_probe/scan_*.json
+/tools/ddc_probe/wyniki*/
+/tools/ddc_probe/*.log
+/tools/ddc_probe/results/
