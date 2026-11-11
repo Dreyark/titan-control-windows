@@ -397,8 +397,8 @@ fn chaos_lost_writes_end_in_a_consistent_state() {
 #[test]
 fn identical_monitor_names_get_separate_cache_entries() {
     let edid = identity::tests::sample_edid(b"0000000000000");
-    let a = identity::from_edid(&edid, "LHC907D\\5&1&0&UID4355").unwrap();
-    let b = identity::from_edid(&edid, "LHC907D\\5&1&0&UID4353").unwrap();
+    let a = identity::from_edid(&edid, "LHC907D\\5&1&0&UID0002").unwrap();
+    let b = identity::from_edid(&edid, "LHC907D\\5&1&0&UID0001").unwrap();
     assert_eq!(a.name, b.name);
 
     let mut store = CacheStore::default();

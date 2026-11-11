@@ -8,7 +8,7 @@ Built with Rust, GTK 4 and libadwaita. It is not affiliated with Titan Army.
 
 > ## About this version
 >
-> This is an independent, maintained-by-me version of [mkarenko/titan-control](https://github.com/mkarenko/titan-control),
+> This is an independent version, maintained separately by [Dreyark](https://github.com/Dreyark), of [mkarenko/titan-control](https://github.com/mkarenko/titan-control),
 > the original Linux app by **mkarenko** (MIT license; the original copyright notice is kept in [LICENSE](LICENSE)).
 > It adds **Windows 10/11 support** (DDC/CI through the Windows Monitor Configuration API), two monitors in one window,
 > write levels, a tray and a Windows installer; see [docs/windows-port.md](docs/windows-port.md) and the

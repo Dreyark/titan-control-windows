@@ -157,7 +157,7 @@ pub fn enumerate_displays() -> Result<Vec<DisplayInfo>, String> {
     Ok(result)
 }
 
-/// `\\?\DISPLAY#MSI3ACF#5&1b2c&0&UID4352#{guid}` -> `MSI3ACF\5&1b2c&0&UID4352`.
+/// `\\?\DISPLAY#MSI3ACF#5&1b2c&0&UID0000#{guid}` -> `MSI3ACF\5&1b2c&0&UID0000`.
 fn registry_key_from_interface(path: &str) -> Option<String> {
     let trimmed = path.trim_start_matches("\\\\?\\");
     let mut parts = trimmed.split('#');

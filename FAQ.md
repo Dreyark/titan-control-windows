@@ -182,7 +182,7 @@ Halo Control, cannot be read back at all; the app then trusts the write.
 ### Two monitors: which one is which?
 
 Both have the same name, product code and (on the author's units) the same serial number, so the app uses the Windows
-device path (`…\UID4353` / `…\UID4355`) as identity. Use the list at the bottom of the sidebar (visible with two
+device path (`…\UID0001` / `…\UID0002`) as identity. Use the list at the bottom of the sidebar (visible with two
 monitors), set an alias, and press *Identify monitors*. The device path can change when a cable is moved to another
 port; the alias is then set again.
 

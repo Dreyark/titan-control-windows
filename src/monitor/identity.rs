@@ -93,8 +93,8 @@ pub(crate) mod tests {
     #[test]
     fn same_edid_different_paths_are_different_monitors() {
         let edid = sample_edid(b"0000000000000");
-        let a = from_edid(&edid, "LHC907D\\5&1&0&UID4355").unwrap();
-        let b = from_edid(&edid, "LHC907D\\5&1&0&UID4353").unwrap();
+        let a = from_edid(&edid, "LHC907D\\5&1&0&UID0002").unwrap();
+        let b = from_edid(&edid, "LHC907D\\5&1&0&UID0001").unwrap();
         assert_eq!(a.name, b.name);
         assert_eq!(a.edid_id, "LHC907D");
         assert_ne!(a, b);
