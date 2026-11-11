@@ -16,6 +16,7 @@ installation and usage see the [README](README.md); every VCP code is in [docs/p
 - ["Monitor not found"](#monitor-not-found)
 - [Does it work on X11, GNOME or other desktops?](#does-it-work-on-x11-gnome-or-other-desktops)
 - [Is it safe?](#is-it-safe)
+- [Windows questions](#windows-questions)
 
 ## Which monitors are supported?
 
@@ -44,6 +45,7 @@ These settings exist on the monitor but cannot be changed (or fully changed) fro
 | Light sensor | No working DDC/CI code (see above); only its effect, the brightness change, is visible |
 | Brightness mode (Normal / Highlight) | No DDC/CI code |
 | Screen mode (Wide / 2K / FHD / 3K / 3K Wide) | No DDC/CI code; it changes the resolution and the picture size |
+| AI Dual Mode (UHD 160 Hz / FHD 320 Hz) | No DDC/CI code found (clean scans, setting off and on); the monitor switches the signal itself. Titan Control only shows whether it is active (*Overview → Display mode*) |
 | Full Game: sPX | Over DDC/CI the monitor accepts only Wide and 25" |
 | Night Vision in the magnifier | DDC/CI code unknown |
 | Break reminder interval | Over DDC/CI only on (30 min) and off; the app shows the interval chosen in the OSD |
@@ -149,3 +151,66 @@ system HDR sync and the wallpaper preview need KDE Plasma. The tray needs Status
 The app never sends writes known to be harmful: picture profile 0, VCP `F0` (turns the monitor off), and
 unconfirmed power modes. Resets and power off ask for confirmation. Every write is read back, and settings the
 monitor rejects jump back to the real value.
+
+## Windows questions
+
+### How does the Windows version talk to the monitor?
+
+Through the Windows Monitor Configuration API (`dxva2`: `GetVCPFeatureAndVCPFeatureReply`, `SetVCPFeature`), the same
+calls the manufacturer's own Windows tool uses. The protocol layer (pacing of requests, the `GET 99` → `GET code`
+sequence for manufacturer registers, retries) is the one of the Linux version; only the transport differs. Windows
+checks every frame itself and hides the raw bytes, so a reply the monitor sends "wrongly" is reported as an error and
+retried. A cable pulled or a monitor switched off is noticed at once (display-change messages of Windows) and the
+monitor returns to the list when it is back.
+
+### Why does the app start read-only, and what are the write levels?
+
+Titan Control changes settings that live in the monitor's own memory. To keep a mistake cheap, writing is **off at
+every start** and is switched on in *Information → Writing to the monitors* (a warning dialog). Then a level is chosen,
+and each higher level needs its own confirmation: **1** brightness, contrast, volume; **2** the other picture
+settings; **3** game aids, PIP, LED, OSD, inputs and system settings. The settings that can lock or switch off the
+monitor (the resets, button lock `CA`, `D6` power modes, `22 = 0`, `F0`, black level `6C/6E/70`, `C7 = 0`) are never
+written from the window. The tray menu has *Stop writing (read-only)* for an immediate stop.
+
+### Brightness and contrast are greyed out, or a value is "not accepted"
+
+The monitor keeps the factory values of a *Default* profile and may ignore a write there. The program shows what the
+monitor really reports after every write; a refused value goes back to the monitor's value, and the log says
+`not confirmed` / `not accepted` (`%LOCALAPPDATA%\titan_control\logs\titan_control.log`). Some registers, for example
+Halo Control, cannot be read back at all; the app then trusts the write.
+
+### Two monitors: which one is which?
+
+Both have the same name, product code and (on the author's units) the same serial number, so the app uses the Windows
+device path (`…\UID4353` / `…\UID4355`) as identity. Use the list at the bottom of the sidebar (visible with two
+monitors), set an alias, and press *Identify monitors*. The device path can change when a cable is moved to another
+port; the alias is then set again.
+
+### Other DDC programs
+
+*VIEW MORE WIDGET*, Twinkle Tray, Dell Display Manager, vendor GPU tools and monitor software send their own DDC/CI
+requests. Two programs on the bus make replies get lost. Close them while you use Titan Control. A GPU driver update
+or a docking station can also change how DDC/CI is passed on; if all readings fail, reconnect the cable or try another
+port.
+
+### The monitor is stuck after a bad write
+
+A monitor has its physical power button and a factory reset in the OSD. Button lock (`CA = 1`, buttons 2 and 3) is
+undone with `CA = 2`; `D6 = 5` keeps the monitor off until a button is pressed. Titan Control does not send any of
+these on its own. Keep a note (or photo) of your OSD settings before you try a new write level.
+
+### "Monitor not found" on Windows
+
+The app only talks to monitors whose EDID name contains `P275MV`. Check that the monitor shows up in the Windows display
+settings, that DDC/CI is enabled in its OSD, that no other DDC program is running, and that the cable is a full DisplayPort
+or HDMI cable (some adapters and KVM switches do not pass DDC/CI). The log lists every display it found
+(`[WIN] \.\DISPLAYn EDID: …`).
+
+### The window is too small, or the text is soft, on a scaled screen
+
+GTK 4 on Windows is DPI aware: the text is sharp and follows the Windows scaling, but the widgets (rows, switches,
+sliders) keep their size. The app therefore opens a larger window on a scaled screen (1280×900 times the scaling, at most
+90% of the screen) and uses an 11 pt font (Windows offers 9 pt, which looks small): *Preferences → Interface size*
+changes it. If you prefer every proportion scaled and accept soft text, start the app with `TITAN_BITMAP_SCALING=1`:
+Windows then scales the whole window like a bitmap. The log (`[UI] screen …`, `[UI] DPI awareness …`,
+`[UI] GTK font …`, `[UI] window default size …`) shows what GTK sees; please attach it to a bug report about sizes.

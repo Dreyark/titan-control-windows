@@ -96,6 +96,30 @@ Then set up [I2C access](#2-i2c-access) unless you ran the script as root, and s
 `./uninstall.sh` removes it again (your settings stay in `~/.config/titan_control`). To build the archive yourself:
 `./scripts/make_tarball.sh` (it ends up in `dist/`).
 
+### Windows (10 and 11, x64)
+
+Get the installer (`TitanControl-<version>-setup.exe`) or the portable ZIP from the release files or from the artifacts
+of the [Windows workflow](.github/workflows/windows.yml). The ZIP needs no installation: unpack it and run
+`bin\titan_control.exe`. The program talks to the monitor through the Windows Monitor Configuration API (DDC/CI), so
+no driver, no administrator rights and no extra software are needed.
+
+- **Read-only at every start.** Writing to the monitors is off until you switch it on (*Information → Writing to the
+  monitors*). Settings are saved in the monitor's memory, so the app asks first and raises the *write level* one step at
+  a time: 1 brightness, contrast, volume; 2 the other picture settings; 3 game aids, PIP, LED, OSD, inputs. Resets and
+  the settings that can lock the monitor are never written. Switching writing off (in the window or in the tray menu)
+  stops it at once.
+- **Two identical monitors** are told apart by their Windows device path; give them aliases (*Information*) and use
+  *Identify monitors* to see which is which. Every write goes to the one monitor that is selected.
+- **Tray, autostart, one instance.** Closing the window hides it to the tray; *Auto start* adds a logon entry that
+  starts the app in the tray. A second start only shows the window of the first.
+- **Display settings.** Resolution and refresh rate of the selected screen can be changed (the new mode has to be
+  confirmed, or it goes back after 15 seconds); HDR of the screen in Windows can be switched. Scaling and the screen
+  layout are changed in the Windows settings (the app has a button for that).
+- Close other DDC programs (the manufacturer's *VIEW MORE WIDGET*, Twinkle Tray, Dell Display Manager) while you use
+  Titan Control: two programs on the bus disturb each other. See the [FAQ](FAQ.md#windows-questions).
+
+To build it yourself, see [docs/building-windows.md](docs/building-windows.md).
+
 ### Building from source
 
 #### 1. Dependencies

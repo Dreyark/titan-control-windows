@@ -431,6 +431,12 @@ FD E0 E1 E2 F0 F3 F7 FE FF)`, `mccs_ver(2.1)`. Manufacturer codes (via `99`) are
   the only candidate. Plain `55` is not it (it returns leftovers like `FA`).
 - **Screen mode** (Wide, 2K, FHD, 3K, 3K Wide; changes the resolution and physical picture size): no register found.
   Only the signal codes `69/AC/AE` and the mode list offered to the computer change.
+- **AI Dual Mode** (UHD 160 Hz <-> FHD 320 Hz, set in the OSD): no register found. Windows DDC scans of 2026-11-11
+  (`ddc_probe --scan`: GET of every code plain and after `99`, 3 tries per code, setting off and on, three pairs of
+  scans; in the cleanest pair 7 registers differ between two valid replies): the only changes are the signal (`69`
+  2160 -> 1080, `AC`, `AE` 160 -> ~323 Hz) and registers that move by themselves (`0B`, `13`, `C0`, `F3`). While the
+  monitor is in UHD mode it offers the computer 1080p only up to 144 Hz and no 320 Hz; in dual mode it switches the
+  signal to 1920x1080 at ~320 Hz by itself. The switch is on the monitor side (OSD), not available over DDC.
 - **DyDs/ULL Pulse, DyDs/LD Pulse, 3D mode, scene follow, shortcuts** from VMW 1.0.2.8: not in this firmware.
 - **CEC (`D9`) and DP/USB-C link rate 5.4G/8.1G (`D7`):** listed by VMW. `D9` writes did nothing. `D7` was not tested
   on purpose, because changing the link rate can drop the picture.
