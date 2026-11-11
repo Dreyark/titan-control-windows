@@ -1,7 +1,9 @@
 # The Windows port: design and status
 
-Titan Control runs on Windows 10/11 (x64) next to the Linux version. This page explains how the port is built, what
-was checked on real hardware and what was not. Build instructions are in [building-windows.md](building-windows.md).
+Titan Control runs on Windows 10/11 (x64) next to the Linux version. This repository ([Dreyark/titan-control-windows](https://github.com/Dreyark/titan-control-windows)) is an
+independent version of [mkarenko/titan-control](https://github.com/mkarenko/titan-control) 1.0.1 (MIT): the protocol work, the monitor
+documentation and the Linux version are the original author's, the port described here is not meant to be sent back to him.
+This page explains how the port is built, what was checked on real hardware and what was not. Build instructions are in [building-windows.md](building-windows.md).
 
 ## What changed, in one picture
 

@@ -161,7 +161,7 @@ jobs:
             | `Titan_Control-*-x86_64.AppImage` | recent distributions (glibc 2.41+); GTK is bundled (`chmod +x`, then run) |
 
             The tar.gz, deb and rpm need GTK ≥ 4.14 and libadwaita ≥ 1.7 on your system. Set up I2C access as described in the
-            [README](https://github.com/mkarenko/titan-control#installation) (the deb, rpm and tar.gz as root do it for you).
+            [README](https://github.com/Dreyark/titan-control-windows#installation) (the deb, rpm and tar.gz as root do it for you).
 
             > Use at your own risk: the software writes settings to your monitor. See the README and the
-            > [firmware notes](https://github.com/mkarenko/titan-control/blob/main/firmware/README.md).
+            > [firmware notes](https://github.com/Dreyark/titan-control-windows/blob/main/firmware/README.md).

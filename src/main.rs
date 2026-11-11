@@ -670,9 +670,9 @@ fn show_about(a: &Rc<App>) {
     content.append(&gtk4::Label::builder().label(app_settings::APP_VERSION).css_classes(["dim-label"]).build());
     let links = adw::PreferencesGroup::builder().margin_top(12).build();
     for (icon, title, url) in [
-        ("web-browser-symbolic", tr_pl(&lang, "Strona programu"), "https://github.com/mkarenko/titan-control"),
-        ("titan-bug-symbolic", tr_pl(&lang, "Zgłoś błąd"), "https://github.com/mkarenko/titan-control/issues/new"),
-        ("titan-coffee-symbolic", "Buy me a coffee".to_string(), "https://buymeacoffee.com/mkarenko"),
+        ("web-browser-symbolic", tr_pl(&lang, "Strona programu"), "https://github.com/Dreyark/titan-control-windows"),
+        ("titan-bug-symbolic", tr_pl(&lang, "Zgłoś błąd"), "https://github.com/Dreyark/titan-control-windows/issues/new"),
+        ("titan-coffee-symbolic", "Support the original author".to_string(), "https://buymeacoffee.com/mkarenko"),
     ] {
         let row = adw::ActionRow::builder().title(title).activatable(true).build();
         row.add_suffix(&gtk4::Image::from_icon_name(icon));

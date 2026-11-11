@@ -1,10 +1,23 @@
 # Titan Control
 
-A Linux app for the **Titan Army P275MV PLUS** monitor. It changes the monitor's own settings over DDC/CI, the
-same settings as the on-screen menu (OSD): picture modes, local dimming, HDR, game overlays, PIP, LED lighting and
-more. Nothing is emulated in software.
+A **Windows and Linux** app for the **Titan Army P275MV PLUS** monitor. It changes the monitor's own settings over
+DDC/CI, the same settings as the on-screen menu (OSD): picture modes, local dimming, HDR, game overlays, PIP, LED
+lighting and more. Nothing is emulated in software.
 
 Built with Rust, GTK 4 and libadwaita. It is not affiliated with Titan Army.
+
+> ## About this version
+>
+> This is an independent, maintained-by-me version of [mkarenko/titan-control](https://github.com/mkarenko/titan-control),
+> the original Linux app by **mkarenko** (MIT license; the original copyright notice is kept in [LICENSE](LICENSE)).
+> It adds **Windows 10/11 support** (DDC/CI through the Windows Monitor Configuration API), two monitors in one window,
+> write levels, a tray and a Windows installer; see [docs/windows-port.md](docs/windows-port.md) and the
+> [CHANGELOG](CHANGELOG.md). It is a separate project: changes here are not sent to the original repository, and
+> the original author is not responsible for them. The protocol work, the monitor documentation and the Linux
+> version are his.
+>
+> **Linux:** the Linux code was moved and adapted for the shared core but could not be compiled while the port was
+> written. If you use Linux, the [original](https://github.com/mkarenko/titan-control) is the tested reference.
 
 > ## ⚠️ Use at your own risk
 >
@@ -16,7 +29,8 @@ Built with Rust, GTK 4 and libadwaita. It is not affiliated with Titan Army.
 >
 > This repository was developed with the help of a large language model (LLM, Claude). The code, documentation and
 > the protocol notes in `docs/` were written and revised with LLM assistance and checked against a real monitor by
-> the author, but **they may still contain mistakes. Review the code before you trust it with your hardware.**
+> the authors (the original author on Linux, the Windows port on two P275MV PLUS monitors), but **they may still
+> contain mistakes. Review the code before you trust it with your hardware.**
 
 <p align="center"><img src="assets/p275mv_plus.png" width="320" alt="Titan Army P275MV PLUS"></p>
 
@@ -59,8 +73,10 @@ The protocol, every VCP code and the tools used to find them are documented in
 
 ## Requirements
 
-- Linux with access to the monitor's I2C bus (`i2c-dev`).
-- GTK ≥ 4.14, libadwaita ≥ 1.7, `blueprint-compiler`, Rust ≥ 1.88.
+- **Windows 10 or 11 (x64):** nothing to install besides the app itself, see [Windows](#windows-10-and-11-x64).
+- **Linux:** access to the monitor's I2C bus (`i2c-dev`).
+- To build: GTK ≥ 4.14, libadwaita ≥ 1.7, `blueprint-compiler` (on Windows the committed `src/ui/window.ui` is
+  used when it cannot be started), Rust ≥ 1.88.
 - Optional:
   - `kscreen-doctor` (KDE Plasma) or `cosmic-randr` (COSMIC) for the display mode, HDR and wallpaper features;
   - a tray that supports StatusNotifierItem (on GNOME: the AppIndicator extension).
@@ -71,7 +87,10 @@ Tested with a P275MV PLUS (Enhanced) connected over DisplayPort to an AMD GPU, o
 
 ### Pre-built files
 
-Every version is published on the [Releases](https://github.com/mkarenko/titan-control/releases) page:
+The Windows installer and ZIP are built by the [Windows workflow](https://github.com/Dreyark/titan-control-windows/actions/workflows/windows.yml) and attached to the
+[Releases](https://github.com/Dreyark/titan-control-windows/releases) page. The Linux files below are built by the original workflow (`release.yml`) when a version tag
+is pushed to this repository; they are **not verified** (see the note at the top), so for Linux the
+[original releases](https://github.com/mkarenko/titan-control/releases) are the safe choice. Files of this repository:
 
 | File | For |
 | --- | --- |
@@ -154,8 +173,8 @@ sudo udevadm control --reload && sudo udevadm trigger
 #### 3. Build and install
 
 ```bash
-git clone https://github.com/mkarenko/titan-control.git
-cd titan-control
+git clone https://github.com/Dreyark/titan-control-windows.git
+cd titan-control-windows
 ./scripts/install_local.sh
 ```
 
@@ -181,7 +200,7 @@ at `~/.local/state/titan_control/titan_control.log` (`$XDG_STATE_HOME` is respec
 GTK and libadwaita versions, the monitor connection, every setting the app writes with the result of its read-back,
 and errors. It is cut at 1 MiB (the older part is kept as `titan_control.log.1`).
 
-When you [open an issue](https://github.com/mkarenko/titan-control/issues/new), please attach the log, say which
+When you [open an issue](https://github.com/Dreyark/titan-control-windows/issues/new), please attach the log, say which
 monitor and firmware package you have, and what you did before the problem. The log contains the monitor name, but no
 serial number or personal data; read it before you share it. For a problem seen while the app is running, starting it
 from a terminal (`titan_control`) prints the same lines.
@@ -213,7 +232,7 @@ TITAN_CHECK_STARS=1 …                                         # show the favor
 
 ## Support
 
-Titan Control is free. If it is useful to you, you can [buy me a coffee ☕](https://buymeacoffee.com/mkarenko).
+Titan Control is free (MIT). The original app and the protocol work are by [mkarenko](https://github.com/mkarenko); if it is useful to you, you can [buy him a coffee ☕](https://buymeacoffee.com/mkarenko). Bugs of this version go to [the issues of this repository](/issues).
 
 ## Releasing
 

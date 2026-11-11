@@ -1,5 +1,8 @@
 # Changelog
 
+This repository ([Dreyark/titan-control-windows](https://github.com/Dreyark/titan-control-windows)) continues [mkarenko/titan-control](https://github.com/mkarenko/titan-control)
+from its version 1.0.1 (MIT license, original copyright kept). Earlier history is the original project's.
+
 ## Unreleased: Windows port
 
 - **Windows 10/11 (x64)** build: DDC/CI through the Monitor Configuration API, portable ZIP and installer (see

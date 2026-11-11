@@ -10,8 +10,8 @@
 AppId={{B3D2A6C1-4E7F-4A58-9C3B-6F1D8E2A7C45}
 AppName=Titan Control
 AppVersion={#Version}
-AppPublisher=Titan Control
-AppPublisherURL=https://github.com/mkarenko/titan-control
+AppPublisher=Dreyark
+AppPublisherURL=https://github.com/Dreyark/titan-control-windows
 DefaultDirName={autopf}\Titan Control
 DefaultGroupName=Titan Control
 DisableProgramGroupPage=yes

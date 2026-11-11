@@ -3,6 +3,11 @@
 The Windows build uses the same Rust code as Linux (GTK 4 + libadwaita) and is built in an **MSYS2 UCRT64**
 environment, because GTK is easiest to get there. Nothing here talks to a monitor.
 
+```sh
+git clone https://github.com/Dreyark/titan-control-windows.git
+cd titan-control-windows
+```
+
 ## 1. Tools
 
 1. Install [MSYS2](https://www.msys2.org/) (for example `winget install MSYS2.MSYS2`, default folder `C:\msys64`).
