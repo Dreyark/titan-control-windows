@@ -1,0 +1,77 @@
+# Windows build: tests that need no hardware, the portable ZIP and the installer.
+# Build chain: MSYS2 UCRT64 (Rust, GTK 4, libadwaita), see docs/building-windows.md.
+# The artifacts are kept for 30 days. Nothing here talks to a monitor.
+name: Windows
+
+on:
+  push:
+    branches: [main, windows-port]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: build, test, ZIP, installer
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MSYS2 and the toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-rust
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-libadwaita
+            mingw-w64-ucrt-x86_64-blueprint-compiler
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-python
+            zip
+
+      - name: Check that src/ui/window.ui is up to date
+        run: |
+          # build.rs falls back to this file when blueprint-compiler cannot be started; it must match window.blp.
+          cp src/ui/window.ui /tmp/window.ui.committed
+          PYTHONUTF8=1 scripts/generate_ui.sh
+          if ! diff -q /tmp/window.ui.committed src/ui/window.ui; then
+            echo "::warning::src/ui/window.ui differs from window.blp (or from this blueprint-compiler version): run scripts/generate_ui.sh and commit it"
+          fi
+
+      - name: Tests (no hardware)
+        run: cargo test --release
+
+      - name: Clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: Portable package
+        run: scripts/package_windows.sh
+
+      - name: Smoke test on a clean PATH (no MSYS2)
+        shell: pwsh
+        run: |
+          $dir = (Get-ChildItem dist -Directory | Select-Object -First 1).FullName
+          ./scripts/smoke_windows.ps1 -Dir $dir
+
+      - name: Installer
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DVersion=$version" packaging\windows\titan_control.iss
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: titan-control-windows
+          path: |
+            dist/*.zip
+            dist/*-setup.exe
+          retention-days: 30
