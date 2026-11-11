@@ -11,15 +11,33 @@ readme = "README.md"
 gtk4 = { version = "0.11.3", features = ["v4_14"] }
 libadwaita = { version = "0.9.1", features = ["v1_7"] }
 async-channel = "2.5.0"
-ksni = { version = "0.3", features = ["blocking"] }
 image = "0.25.10"
-i2c-linux = "0.1.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.150"
 dirs = "6.0.0"
 
+[build-dependencies]
+# Windows: icon, version info and the DPI manifest (assets/windows/titan_control.rc).
+embed-resource = "3"
+
+[target.'cfg(unix)'.dependencies]
+ksni = { version = "0.3", features = ["blocking"] }
+i2c-linux = "0.1.2"
+
 [target.'cfg(windows)'.dependencies]
 tray-icon = { version = "0.24.1", default-features = false }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Devices_Display",
+    "Win32_Graphics_Gdi",
+    "Win32_Media",
+    "Win32_System_Registry",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_HiDpi",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [package.metadata.deb]
 name = "titan-control"

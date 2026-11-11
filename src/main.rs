@@ -1,8 +1,18 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 #[macro_use]
 mod log;
 mod app_settings;
 mod i18n;
 mod monitor;
+mod multi;
+mod paths;
+mod platform;
+#[cfg(unix)]
+mod tray;
+// Windows: tray-icon on its own thread, same API as the Linux tray.
+#[cfg(not(unix))]
+#[path = "tray_windows.rs"]
 mod tray;
 mod ui;
 
@@ -21,8 +31,60 @@ use ui::Ui;
 use ui::bindings::{self, Bindings, Control};
 use ui::translate::tr_pl;
 
+/// Started with `--minimized` (autostart): the window stays hidden, the tray is the way in.
+static START_MINIMIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Requests of a second instance to show the window (Windows).
+#[cfg(windows)]
+static SHOW_REQUESTS: std::sync::OnceLock<async_channel::Receiver<()>> = std::sync::OnceLock::new();
+
 fn main() {
+    // Windows: GTK 4 is DPI aware (sharp text) but scales only the fonts, not the widgets; the window therefore gets a
+    // larger default size on a scaled screen (see `windows_window_size`). `TITAN_BITMAP_SCALING=1` switches GTK's
+    // HiDPI off instead: Windows then scales the whole window, which keeps every proportion but makes the text soft.
+    #[cfg(windows)]
+    if std::env::var_os("TITAN_BITMAP_SCALING").is_some() && std::env::var_os("GDK_WIN32_DISABLE_HIDPI").is_none() {
+        // SAFETY: nothing else runs yet (no other threads exist before GTK starts).
+        unsafe { std::env::set_var("GDK_WIN32_DISABLE_HIDPI", "1") };
+    }
+    // Safe mode: no access to the monitor hardware (`--no-ddc` or `TITAN_NO_DDC=1`). GTK must not see the option.
+    let mut args: Vec<String> = std::env::args().collect();
+    let no_ddc_flag = args.iter().skip(1).any(|arg| arg == "--no-ddc");
+    args.retain(|arg| arg != "--no-ddc");
+    monitor::set_no_ddc(no_ddc_flag || std::env::var("TITAN_NO_DDC").is_ok_and(|value| value == "1"));
+    // `--minimized` (the autostart entry): start in the tray. Not a setting, so it is not saved.
+    START_MINIMIZED.store(args.iter().skip(1).any(|arg| arg == "--minimized"), std::sync::atomic::Ordering::Relaxed);
+    args.retain(|arg| arg != "--minimized");
     log::init();
+    // Windows: one instance at a time (two instances must never talk to the monitors together). A second start only
+    // asks the first one to show its window and ends. Development modes without hardware are exempt.
+    #[cfg(windows)]
+    let _single_instance = if std::env::var_os("TITAN_CHECK_UI").is_none() && std::env::var_os("TITAN_FAKE_MONITORS").is_none() {
+        // `TITAN_INSTANCE_ID` gives a test run its own lock, so a smoke test does not meet the app that is open.
+        let instance = match std::env::var("TITAN_INSTANCE_ID") {
+            Ok(id) if !id.is_empty() => format!("{}.{id}", app_settings::APP_ID),
+            _ => app_settings::APP_ID.to_string(),
+        };
+        match platform::windows::acquire_single_instance(&instance) {
+            Some((guard, requests)) => {
+                let (tx, rx) = async_channel::unbounded::<()>();
+                let _ = SHOW_REQUESTS.set(rx);
+                std::thread::spawn(move || {
+                    while requests.recv().is_ok() {
+                        if tx.send_blocking(()).is_err() {
+                            break;
+                        }
+                    }
+                });
+                Some(guard)
+            }
+            None => {
+                log!("[APP] another instance is running: asked it to show its window");
+                return;
+            }
+        }
+    } else {
+        None
+    };
     // GTK's own texts (search fields, empty lists) follow the language chosen in the app, not only the system one.
     if let Some(index) = app_settings::load().language {
         let language = if i18n::lang_from_index(index) == AppLang::PL { "pl_PL:pl" } else { "en_US:en" };
@@ -31,14 +93,14 @@ fn main() {
     }
     glib::set_application_name(app_settings::APP_DISPLAY_NAME);
     // The UI check must not activate a running instance (single-instance app over D-Bus).
-    let flags = if std::env::var_os("TITAN_CHECK_UI").is_some() {
+    let flags = if std::env::var_os("TITAN_CHECK_UI").is_some() || cfg!(windows) {
         gio::ApplicationFlags::NON_UNIQUE
     } else {
         gio::ApplicationFlags::empty()
     };
     let app = adw::Application::builder().application_id(app_settings::APP_ID).flags(flags).build();
     app.connect_activate(build_application);
-    app.run();
+    app.run_with_args(&args);
 }
 
 /// Settings that belong to the picture profile table: they can only be changed in a Custom profile.
@@ -172,6 +234,8 @@ struct App {
     system_display: RefCell<Option<monitor::SystemDisplayState>>,
     connector: RefCell<String>,
     info: RefCell<Option<monitor::MonitorInfo>>,
+    /// The monitors of the sessions and which one is shown (see `multi.rs`).
+    monitors: multi::Monitors,
     tray_favorites: tray::TrayFavoritesState,
     tray_shortcuts: tray::TrayShortcutsState,
     tray_active_mode: tray::TrayActiveModeState,
@@ -257,10 +321,23 @@ fn build_application(app: &adw::Application) {
     register_app_icons();
     let _ = app_settings::ensure_desktop_entry();
 
-    let cfg = app_settings::load();
+    let mut cfg = app_settings::load();
+    if START_MINIMIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        cfg.start_minimized = true;
+    }
     let lang = resolve_lang(cfg.language);
     apply_theme(cfg.theme);
     let ui = Ui::new(app);
+    #[cfg(windows)]
+    // `TITAN_FONT_SIZE` is for layout checks (`TITAN_CHECK_UI_SHOTS`) without changing the saved setting.
+    multi::apply_font_size(std::env::var("TITAN_FONT_SIZE").ok().and_then(|v| v.parse().ok()).or(cfg.ui_font_size));
+    // The default window is larger than the Linux one so that the monitor list and the pages are visible at once.
+    #[cfg(windows)]
+    {
+        let (width, height) = windows_window_size();
+        ui.window.set_default_size(width, height);
+    }
+    log_display_scaling(&ui.window);
 
     // Layout check without a monitor: `TITAN_CHECK_UI=1 titan_control` (`TITAN_CHECK_LANG=en|pl` picks the language).
     if std::env::var_os("TITAN_CHECK_UI").is_some() {
@@ -292,7 +369,7 @@ fn build_application(app: &adw::Application) {
 
     let info_texts = ui.subtitles_to_info(INFO_ROWS);
     let (worker_tx, worker_rx) = mpsc::channel::<WorkerCmd>();
-    let (ui_tx, ui_rx) = async_channel::unbounded::<monitor::UiCmd>();
+    let (ui_tx, ui_rx) = async_channel::unbounded::<monitor::SessionEvent>();
     let splash = build_splash(app, &lang, !cfg.start_minimized);
     let _ = worker_tx.send(WorkerCmd::DydsWithAdaptiveSync(cfg.firmware_package.dyds_with_adaptive_sync()));
     let bindings = Bindings::new(worker_tx, ui.scales.clone());
@@ -311,6 +388,7 @@ fn build_application(app: &adw::Application) {
         system_display: RefCell::default(),
         connector: RefCell::default(),
         info: RefCell::default(),
+        monitors: multi::Monitors::default(),
         stars: RefCell::default(),
         picture_star: RefCell::default(),
         tray: RefCell::default(),
@@ -336,6 +414,11 @@ fn build_application(app: &adw::Application) {
     setup_system_display(a);
     setup_preferences(a);
     setup_info(a);
+    multi::setup(a);
+    #[cfg(debug_assertions)]
+    if std::env::var_os("TITAN_FAKE_SELFTEST").is_some() {
+        multi::selftest(a, app);
+    }
     setup_favorites(a);
     a.ui.align_rows();
     {
@@ -361,6 +444,25 @@ fn build_application(app: &adw::Application) {
                 *state = window.is_visible();
             }
             a2.refresh_tray();
+        });
+    }
+    // A second instance asks for the window; the system theme can change while the app runs (Windows).
+    #[cfg(windows)]
+    {
+        if let Some(requests) = SHOW_REQUESTS.get().cloned() {
+            let window = a.ui.window.clone();
+            glib::spawn_future_local(async move {
+                while requests.recv().await.is_ok() {
+                    window.set_visible(true);
+                    window.present();
+                }
+            });
+        }
+        let a2 = a.clone();
+        a.ui.window.connect_is_active_notify(move |window| {
+            if window.is_active() && a2.cfg.borrow().theme == 0 {
+                apply_theme(0);
+            }
         });
     }
     // Closing hides the window to the tray.
@@ -426,8 +528,19 @@ fn apply_theme(theme: u32) {
     adw::StyleManager::default().set_color_scheme(match theme {
         1 => adw::ColorScheme::ForceLight,
         2 => adw::ColorScheme::ForceDark,
-        _ => adw::ColorScheme::Default,
+        _ => system_color_scheme(),
     });
+}
+
+/// GTK on Windows does not know the system theme: it is read from the registry (`AppsUseLightTheme`).
+fn system_color_scheme() -> adw::ColorScheme {
+    #[cfg(windows)]
+    match platform::windows::apps_use_light_theme() {
+        Some(true) => return adw::ColorScheme::ForceLight,
+        Some(false) => return adw::ColorScheme::ForceDark,
+        None => {}
+    }
+    adw::ColorScheme::Default
 }
 
 /// Startup window while the monitor is searched for: logo, name, spinner and the current step.
@@ -1000,7 +1113,9 @@ fn sync_state(a: &Rc<App>) {
     };
 
     // Picture profile: the table settings can only be changed in a Custom profile.
-    let custom = get(VCP_MODE).is_none_or(|mode| is_custom_profile(mode as u8));
+    // Windows, write level 2 and up: the lock of Default profiles is lifted for trying (the monitor may ignore such a
+    // write; the read-back then puts the real value back in the control).
+    let custom = get(VCP_MODE).is_none_or(|mode| is_custom_profile(mode as u8)) || monitor::default_profile_unlocked();
     let loading = a.profile_loading.get();
     for &code in PROFILE_LOCKED {
         allow(code, custom && !loading);
@@ -1107,6 +1222,7 @@ fn sync_state(a: &Rc<App>) {
     if changed.unwrap_or(false) {
         a.refresh_tray();
     }
+    multi::enforce_read_only(a);
 }
 
 /// Mirrors the monitor HDR (any mode but Off) to the system HDR of its output, once the value is stable.
@@ -1164,6 +1280,9 @@ fn setup_system_display(a: &Rc<App>) {
             };
             match monitor::set_system_display_mode(&state.output, &resolution, refresh.as_deref(), scale) {
                 Ok(()) => {
+                    // Windows: the new mode is tried, not saved: the user keeps it or it goes back after 15 s.
+                    #[cfg(windows)]
+                    multi::confirm_display_change(&a2, state.output.clone());
                     let a3 = a2.clone();
                     glib::timeout_add_local_once(Duration::from_millis(350), move || refresh_system_display(&a3));
                 }
@@ -1200,6 +1319,11 @@ fn refresh_system_display(a: &Rc<App>) {
                 let scales: Vec<String> = state.scaling_options.iter().map(|value| format!("{value}%")).collect();
                 fill(&combos[2], &scales, &format!("{}%", state.current_scale_percent));
                 combos.iter().for_each(|combo| combo.set_sensitive(true));
+                // Windows has no public call for the scaling: it is shown, and changed in the Windows settings.
+                if cfg!(windows) {
+                    combos[2].set_sensitive(false);
+                    group.set_description(Some(&tr(&a.lang(), "sys_read_only")));
+                }
                 a.system_hdr.set(state.hdr);
                 wallpaper = monitor::system_wallpaper(&state);
                 *a.system_display.borrow_mut() = Some(state);
@@ -1215,6 +1339,8 @@ fn refresh_system_display(a: &Rc<App>) {
             }
         }
     });
+    #[cfg(windows)]
+    multi::refresh_display_extras(a);
     a.ui.show_wallpaper(wallpaper);
     sync_state(a);
 }
@@ -1338,73 +1464,18 @@ fn show_monitor_info(a: &Rc<App>, info: &monitor::MonitorInfo) {
     ));
     ui.get::<adw::ActionRow>("info_model").set_subtitle(&info.name);
     ui.get::<adw::ActionRow>("info_usage").set_subtitle(&usage);
-    let label = if info.connector.is_empty() {
-        info.name.clone()
-    } else {
-        format!("{} ({})", info.name, info.connector.split_once('-').map(|(_, c)| c).unwrap_or(&info.connector))
-    };
-    // The app drives one monitor; the selector appears only when there is a choice.
-    let select: gtk4::DropDown = ui.get("monitor_select");
-    select.set_model(Some(&gtk4::StringList::new(&[label.as_str()])));
-    select.set_visible(select.model().is_some_and(|model| model.n_items() > 1));
 }
 
 fn receive_monitor_messages(
     a: &Rc<App>,
-    ui_rx: async_channel::Receiver<monitor::UiCmd>,
+    ui_rx: async_channel::Receiver<monitor::SessionEvent>,
     splash: (adw::Window, gtk4::Label),
     app: adw::Application,
 ) {
     let a = a.clone();
     glib::spawn_future_local(async move {
-        let (splash, splash_label) = splash;
-        while let Ok(message) = ui_rx.recv().await {
-            match message {
-                monitor::UiCmd::MonitorFound(info) => {
-                    *a.connector.borrow_mut() = info.connector.clone();
-                    show_monitor_info(&a, &info);
-                    a.bindings.apply(&info.settings, true);
-                    *a.info.borrow_mut() = Some(info);
-                    refresh_system_display(&a);
-                    splash.close();
-                    if !a.cfg.borrow().start_minimized {
-                        a.ui.window.present();
-                    }
-                }
-                monitor::UiCmd::Settings(values) => a.bindings.apply(&values, true),
-                monitor::UiCmd::ProfileLoaded => finish_profile_load(&a),
-                monitor::UiCmd::Corrected(values) => a.bindings.apply(&values, false),
-                monitor::UiCmd::Progress(message) => {
-                    splash_label.set_label(&translate_startup_message(&a.lang(), &message));
-                }
-                monitor::UiCmd::Error(error) => {
-                    splash_label.set_label(&translate_startup_message(&a.lang(), &error));
-                    if !splash.is_visible() {
-                        splash.present();
-                    }
-                    if error == "Monitor not found" {
-                        let app = app.clone();
-                        glib::timeout_add_local_once(Duration::from_secs(3), move || app.quit());
-                    }
-                }
-                monitor::UiCmd::UsageTimeUpdated(usage_mins) => {
-                    a.ui.get::<adw::ActionRow>("info_usage").set_subtitle(&format_usage_minutes(usage_mins));
-                }
-                monitor::UiCmd::InfoRefreshed { hz, usage_mins } => {
-                    let mut info = a.info.borrow_mut();
-                    let Some(info) = info.as_mut() else { continue };
-                    if let Some(hz) = hz {
-                        info.hz = hz;
-                    }
-                    if let Some(usage_mins) = usage_mins {
-                        info.usage_mins = usage_mins;
-                    }
-                    if let Some(state) = a.system_display.borrow().as_ref() {
-                        info.resolution = state.current_resolution.clone();
-                    }
-                    show_monitor_info(&a, info);
-                }
-            }
+        while let Ok(event) = ui_rx.recv().await {
+            multi::handle_event(&a, event, &splash, &app);
         }
     });
 }
@@ -1588,6 +1659,8 @@ fn setup_tray(app: &adw::Application, a: &Rc<App>) {
         option,
     );
     *a.tray.borrow_mut() = Some(control.clone());
+    #[cfg(windows)]
+    multi::attach_tray(a, &control);
     let a2 = a.clone();
     a.ui.get::<adw::ComboRow>("pref_tray_icon").connect_selected_notify(move |combo| {
         if bindings::suppressed() {
@@ -1601,4 +1674,65 @@ fn setup_tray(app: &adw::Application, a: &Rc<App>) {
         a2.save_cfg(|cfg| cfg.tray_icon_style = style);
         control.set_style(style);
     });
+}
+
+/// Logs what GTK knows about the screens and their scaling (a bug report about a window that is too small or too big
+/// needs these numbers).
+fn log_display_scaling(window: &adw::ApplicationWindow) {
+    let Some(display) = gtk4::gdk::Display::default() else { return };
+    let monitors = display.monitors();
+    for index in 0..monitors.n_items() {
+        if let Some(monitor) = monitors.item(index).and_downcast::<gtk4::gdk::Monitor>() {
+            let geometry = monitor.geometry();
+            log!(
+                "[UI] screen {}: {} at {},{} size {}x{} (GTK px), scale {}",
+                index,
+                monitor.connector().unwrap_or_default(),
+                geometry.x(),
+                geometry.y(),
+                geometry.width(),
+                geometry.height(),
+                monitor.scale()
+            );
+        }
+    }
+    #[cfg(windows)]
+    log!("[UI] {}", platform::windows::dpi_report());
+    if let Some(settings) = gtk4::Settings::default() {
+        log!(
+            "[UI] GTK font \"{}\", xft dpi {} (1024 per dpi: 98304 = 96 dpi)",
+            settings.gtk_font_name().unwrap_or_default(),
+            settings.gtk_xft_dpi()
+        );
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        log!("[APP] running {} (built for {})", exe.display(), std::env::consts::ARCH);
+    }
+    let (width, height) = window.default_size();
+    log!("[UI] window default size {width}x{height} (GTK px), scale factor {}", window.scale_factor());
+}
+
+/// Default size of the main window on Windows. With GTK's own DPI handling (sharp text) the window is counted in
+/// physical pixels and the widgets are not scaled, so a 150% screen needs a 1.5 times larger window to give the
+/// same room; in bitmap-scaling mode (`TITAN_BITMAP_SCALING`) Windows does that itself. Never larger than 90% of the
+/// primary screen.
+#[cfg(windows)]
+fn windows_window_size() -> (i32, i32) {
+    const BASE: (f64, f64) = (1280.0, 900.0);
+    let bitmap_scaling = std::env::var_os("GDK_WIN32_DISABLE_HIDPI").is_some();
+    let scale = if bitmap_scaling {
+        1.0
+    } else {
+        platform::windows::query_display_modes(None).map_or(1.0, |(_, modes)| modes.scale_percent as f64 / 100.0)
+    };
+    let (mut width, mut height) = (BASE.0 * scale, BASE.1 * scale);
+    if let Some(monitor) = gtk4::gdk::Display::default()
+        .and_then(|display| display.monitors().item(0))
+        .and_downcast::<gtk4::gdk::Monitor>()
+    {
+        let geometry = monitor.geometry();
+        width = width.min(geometry.width() as f64 * 0.9);
+        height = height.min(geometry.height() as f64 * 0.9);
+    }
+    (width.round() as i32, height.round() as i32)
 }

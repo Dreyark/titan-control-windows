@@ -1,5 +1,6 @@
 //! Log file for bug reports: everything the app prints with `log!` goes to stderr and to
-//! `~/.local/state/titan_control/titan_control.log` (`$XDG_STATE_HOME` is respected). The file is cut when it
+//! `~/.local/state/titan_control/titan_control.log` (`$XDG_STATE_HOME` is respected; on Windows
+//! `%LOCALAPPDATA%\titan_control\logs\titan_control.log`, see `paths::log_dir`). The file is cut when it
 //! grows past 1 MiB (the previous one is kept as `titan_control.log.1`), so it never becomes large.
 
 use std::fs::{self, File, OpenOptions};
@@ -19,11 +20,7 @@ macro_rules! log {
 }
 
 pub fn dir() -> PathBuf {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("state")))
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("titan_control")
+    crate::paths::log_dir()
 }
 
 pub fn file_path() -> PathBuf {

@@ -162,6 +162,8 @@ struct SliderSend {
 }
 
 type Sender = Rc<dyn Fn(u16)>;
+/// Decides whether a setting may be written (see `Bindings::set_write_filter`).
+pub type WriteFilter = Rc<dyn Fn(u8) -> bool>;
 
 pub struct Bindings {
     tx: mpsc::Sender<WorkerCmd>,
@@ -173,6 +175,9 @@ pub struct Bindings {
     sliders: RefCell<HashMap<u8, SliderSend>>,
     listeners: RefCell<Vec<Rc<dyn Fn()>>>,
     scales: RefCell<Vec<gtk4::Scale>>,
+    /// Which settings may be written now (write level, Windows); others stay greyed out whatever the dependencies
+    /// between settings say. `None` = all.
+    write_filter: RefCell<Option<WriteFilter>>,
 }
 
 impl Bindings {
@@ -186,6 +191,7 @@ impl Bindings {
             sliders: RefCell::default(),
             listeners: RefCell::default(),
             scales: RefCell::new(scales),
+            write_filter: RefCell::new(None),
         })
     }
 
@@ -390,7 +396,27 @@ impl Bindings {
     }
 
     /// Greys out (or enables) every control of a setting.
+    pub fn set_write_filter(&self, filter: Option<WriteFilter>) {
+        *self.write_filter.borrow_mut() = filter;
+    }
+
+    fn write_allowed(&self, code: u8) -> bool {
+        self.write_filter.borrow().as_ref().is_none_or(|filter| filter(code))
+    }
+
+    /// The rows of every control whose setting satisfies `wanted`.
+    pub fn rows_where(&self, wanted: impl Fn(u8) -> bool) -> Vec<gtk4::Widget> {
+        let scales = self.scales.borrow();
+        self.controls
+            .borrow()
+            .iter()
+            .filter(|(code, _)| wanted(*code))
+            .flat_map(|(_, control)| control.rows(&scales))
+            .collect()
+    }
+
     pub fn set_sensitive(&self, code: u8, sensitive: bool) {
+        let sensitive = sensitive && self.write_allowed(code);
         let scales = self.scales.borrow();
         for (bound_code, control) in self.controls.borrow().iter() {
             if *bound_code == code {

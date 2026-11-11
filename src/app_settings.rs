@@ -1,3 +1,5 @@
+#![cfg_attr(not(unix), allow(dead_code))]
+
 use crate::monitor;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -31,6 +33,13 @@ pub struct AppSettings {
     pub language: Option<u32>,
     /// 0 = system, 1 = light, 2 = dark.
     pub theme: u32,
+    /// User names of monitors (the same model twice), keyed by the cache key of the `MonitorId`.
+    pub monitor_aliases: std::collections::HashMap<String, String>,
+    /// Cache key of the monitor that was shown last; chosen again at the next start when it is connected.
+    pub last_selected_monitor: Option<String>,
+    /// Windows: size of the interface font in points (`None` = 11, the size the design is made for; Windows itself
+    /// offers 9, which makes the whole window look small and dense).
+    pub ui_font_size: Option<u32>,
 }
 
 /// Look of the tray icon.
@@ -123,6 +132,7 @@ pub fn save(settings: &AppSettings) -> io::Result<()> {
     fs::write(path, data)
 }
 
+#[cfg(unix)]
 pub fn sync_autostart(settings: &AppSettings) -> io::Result<()> {
     let autostart_path = autostart_file();
     if settings.auto_start {
@@ -134,6 +144,28 @@ pub fn sync_autostart(settings: &AppSettings) -> io::Result<()> {
     Ok(())
 }
 
+/// Windows: the `HKCU\...\Run` entry starts the app minimised (to the tray) at logon.
+#[cfg(windows)]
+pub fn sync_autostart(settings: &AppSettings) -> io::Result<()> {
+    let command = settings.auto_start.then(|| {
+        let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        format!("\"{exe}\" --minimized")
+    });
+    crate::platform::windows::set_autostart_value(crate::platform::windows::AUTOSTART_VALUE, command.as_deref())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn sync_autostart(_settings: &AppSettings) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "autostart is not implemented on this platform"))
+}
+
+/// Freedesktop menu entries do not exist on Windows.
+#[cfg(not(unix))]
+pub fn ensure_desktop_entry() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
 pub fn ensure_desktop_entry() -> io::Result<()> {
     // A package (installed under /usr) brings its own menu entry; only a build run from elsewhere writes one.
     if std::env::current_exe().is_ok_and(|exe| exe.starts_with("/usr")) {
@@ -165,23 +197,11 @@ fn desktop_file() -> PathBuf {
 }
 
 fn config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(dir)
-    } else if let Some(home) = dirs::home_dir() {
-        home.join(".config")
-    } else {
-        PathBuf::from(".")
-    }
+    crate::paths::config_base().unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn data_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
-        PathBuf::from(dir)
-    } else if let Some(home) = dirs::home_dir() {
-        home.join(".local").join("share")
-    } else {
-        PathBuf::from(".")
-    }
+    crate::paths::data_base().unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn ensure_parent_dir(path: &Path) -> io::Result<()> {

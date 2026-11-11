@@ -1,23 +1,47 @@
-mod kde;
+// Linux-only code (I2C bus scan, DRM, EDID over I2C) is gated with `cfg(unix)`; the Windows-only parts (sessions,
+// identity, bus lock, write levels) are unused on Linux and the other way round, so dead code is not reported here.
+#![allow(dead_code)]
+#![allow(clippy::items_after_test_module)]
 
-use i2c_linux::I2c;
+mod kde;
+#[cfg(test)]
+mod mock;
+mod cache;
+mod ddc;
+pub mod identity;
+pub mod transport;
+mod session;
+mod worker;
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
-    fs::{File, OpenOptions},
-    io::{self, Read, Write},
-    path::{Path, PathBuf},
-    process::Command,
+    io,
+    path::PathBuf,
     sync::mpsc,
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
+    sync::{Arc, OnceLock},
     thread,
     time::{Duration, Instant},
 };
+#[cfg(unix)]
+use std::{fs::File, io::Read, path::Path};
+
+#[cfg(not(windows))]
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
-
-const DDC_ADDR: u16 = 0x37;
-const DDC_DEST: u8 = 0x6E;
-const DDC_SRC: u8 = 0x51;
+use transport::{FrameError, VcpReply, VcpTransport};
+use cache::*;
+use ddc::*;
+#[allow(unused_imports)]
+pub use ddc::{IdentityGuard, WriteLevel};
+#[allow(unused_imports)]
+pub use identity::MonitorId;
+#[allow(unused_imports)]
+pub use session::{MonitorSession, Router, SessionEvent, SessionManager, forward_tagged};
+pub use ddc::is_custom_profile;
+use worker::*;
 
 pub const VCP_BRIGHTNESS: u8 = 0x10;
 pub const VCP_CONTRAST: u8 = 0x12;
@@ -182,8 +206,6 @@ const PROFILE_TABLE_CHUNKS: usize = 10;
 const VCP_RESEND: u8 = 0xFF;
 /// Minimum start-to-start interval of requests (reads and writes); shorter gaps produce many lost replies.
 const REQUEST_GAP: Duration = Duration::from_millis(100);
-/// Write -> read delay of a GET request.
-const REPLY_DELAY: Duration = Duration::from_millis(40);
 /// Pause after a failed reply (as the manufacturer's program).
 const RETRY_WAIT: Duration = Duration::from_millis(324);
 const UNSUPPORTED_WAIT: Duration = Duration::from_millis(200);
@@ -198,565 +220,7 @@ const TABLE_BUDGET: Duration = Duration::from_secs(60);
 /// Two consecutive identical reads are required before the table is trusted.
 const TABLE_CONFIRMATIONS: usize = 2;
 
-#[derive(Clone, Copy, Debug)]
-pub struct VcpReply {
-    pub maximum: u16,
-    pub current: u16,
-}
-
-#[derive(Clone, Debug)]
-pub struct ProfileTable {
-    pub scene_id: u8,
-    pub bytes: [u8; PROFILE_TABLE_LEN],
-}
-
-impl ProfileTable {
-    pub fn settings(&self) -> HashMap<u8, u16> {
-        let mut settings = HashMap::new();
-
-        settings.insert(VCP_BRIGHTNESS, self.bytes[2] as u16);
-        settings.insert(VCP_CONTRAST, self.bytes[3] as u16);
-        settings.insert(VCP_SHARPNESS, self.bytes[4] as u16);
-        settings.insert(VCP_COLOR_ENHANCE, self.bytes[5] as u16);
-        settings.insert(VCP_CR_ENHANCE, self.bytes[6] as u16);
-        settings.insert(VCP_SHADOW_BALANCE, self.bytes[7] as u16);
-        settings.insert(VCP_COLOR_TEMP, self.bytes[8] as u16);
-        settings.insert(VCP_USER1_RED, self.bytes[9] as u16);
-        settings.insert(VCP_USER1_GREEN, self.bytes[10] as u16);
-        settings.insert(VCP_USER1_BLUE, self.bytes[11] as u16);
-        settings.insert(VCP_USER2_RED, self.bytes[12] as u16);
-        settings.insert(VCP_USER2_GREEN, self.bytes[13] as u16);
-        settings.insert(VCP_USER2_BLUE, self.bytes[14] as u16);
-        settings.insert(VCP_USER3_RED, self.bytes[15] as u16);
-        settings.insert(VCP_USER3_GREEN, self.bytes[16] as u16);
-        settings.insert(VCP_USER3_BLUE, self.bytes[17] as u16);
-        settings.insert(VCP_HUE_RED, self.bytes[18] as u16);
-        settings.insert(VCP_HUE_GREEN, self.bytes[19] as u16);
-        settings.insert(VCP_HUE_BLUE, self.bytes[20] as u16);
-        settings.insert(VCP_HUE_YELLOW, self.bytes[21] as u16);
-        settings.insert(VCP_HUE_CYAN, self.bytes[22] as u16);
-        settings.insert(VCP_HUE_MAGENTA, self.bytes[23] as u16);
-        settings.insert(VCP_SATURATION_RED, self.bytes[24] as u16);
-        settings.insert(VCP_SATURATION_GREEN, self.bytes[25] as u16);
-        settings.insert(VCP_SATURATION_BLUE, self.bytes[26] as u16);
-        settings.insert(VCP_SATURATION_YELLOW, self.bytes[27] as u16);
-        settings.insert(VCP_SATURATION_CYAN, self.bytes[28] as u16);
-        settings.insert(VCP_SATURATION_MAGENTA, self.bytes[29] as u16);
-        // The table keeps Low Blue Light as 0-100 in steps of 25; the setting (0xD8) is the level 0-4.
-        settings.insert(VCP_LOW_BLUE, (self.bytes[30] as u16 + 12) / 25);
-        settings.insert(VCP_HDR, self.bytes[31] as u16);
-        settings.insert(VCP_GAMMA, self.bytes[33] as u16);
-        settings.insert(VCP_SUPER_RES, self.bytes[34] as u16);
-        settings.insert(VCP_NIGHT_VISION, self.bytes[35] as u16);
-        settings.insert(VCP_DYNAMIC_OD, self.bytes[36] as u16);
-
-        settings
-    }
-}
-
-pub struct MsiDdc {
-    i2c: I2c<File>,
-    last_request: Option<Instant>,
-    /// Set after a failed exchange: the next operation first waits for the monitor to answer again.
-    needs_settle: bool,
-}
-
-/// Active picture profile as read from the monitor.
-#[derive(Clone, Debug)]
-pub enum ActiveProfile {
-    /// Custom profile with its settings table.
-    Custom(ProfileTable),
-    /// Default profile (odd code): its settings are read one by one.
-    Default(u8),
-}
-
-enum TableRead {
-    Table(u8, [u8; PROFILE_TABLE_CHUNKS * 4]),
-    Default(u8),
-}
-
-/// Custom profiles have even codes (Standard Custom = 2 ... DyDs/LD Custom = 0x1E), Default profiles odd ones.
-pub fn is_custom_profile(scene_id: u8) -> bool {
-    scene_id.is_multiple_of(2)
-}
-
-/// Outcome of a strict single DDC/CI reply read.
-#[derive(Debug)]
-enum FrameError {
-    /// `6e 80 be`: the monitor is busy; a stream fragment was not consumed.
-    Null,
-    /// Bytes that are not a reply: the monitor did not answer in time or is in an outage.
-    Garbage,
-    /// Valid reply with status "unsupported" (sometimes transient).
-    Unsupported,
-    Io(io::Error),
-}
-
-impl FrameError {
-    fn describe(&self) -> String {
-        match self {
-            FrameError::Null => "NULL reply".into(),
-            FrameError::Garbage => "invalid reply".into(),
-            FrameError::Unsupported => "unsupported".into(),
-            FrameError::Io(error) => format!("I/O: {error}"),
-        }
-    }
-}
-
-/// Register a setting lives in (docs/p275mv_plus.md, "Dostęp do kodów").
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Access {
-    /// Manufacturer register: read `GET 99` -> `GET code`, write `SET 99 = v` -> `SET code = v`.
-    Vendor,
-    /// Codes 00-1E: read plain (after `GET 99` they select a profile table stream), written with `99` like VMW.
-    Table,
-    /// Standard MCCS register: plain read and plain write.
-    Plain,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Route {
-    code: u8,
-    access: Access,
-    /// Read the value back after a write (actions such as resets and power modes cannot be verified).
-    verify: bool,
-}
-
-impl Route {
-    /// Value of a reply. Manufacturer registers such as 0x51/0x52/0x57 answer `ff05/69xx`: the low byte is the value.
-    fn value(&self, reply: VcpReply) -> u16 {
-        if self.access == Access::Vendor
-            && reply.maximum >> 8 == 0xFF
-            && reply.maximum != 0xFFFF
-            && reply.current > 0xFF
-        {
-            reply.current & 0xFF
-        } else {
-            reply.current
-        }
-    }
-}
-
-/// Codes whose working register is the plain MCCS one, although some of them also answer after `GET 99`.
-const PLAIN_CODES: &[u8] = &[
-    0x02, // New control value
-    0x39, // LED: only a plain SET changes it
-    VCP_INPUT_SOURCE,
-    0x62, // Volume (MCCS mirror of 0xF6)
-    0x68, // OSD language (0 = English)
-    0x69, // input signal active lines
-    0x6C, 0x6E, 0x70, // video black level R/G/B
-    0x8D, // Audio mute (MCCS mirror of 0xF7, inverted)
-    0xAC, 0xAE, // signal frequencies
-    0xB0, // save/restore settings
-    0xC8, // controller type
-    VCP_BUTTON_LOCK,
-    VCP_OSD_LANG,
-    VCP_DPMS,
-    VCP_DISPLAY_APPLICATION,
-    VCP_VERSION,
-    VCP_ADAPTIVE_SYNC,
-    VCP_USAGE_TIME,
-    VCP_FIRMWARE,
-];
-
-/// MCCS restore commands: written plain with value 1 (0x04 factory, 0x05 brightness/contrast, 0x06 geometry,
-/// 0x08 colors, 0x0A TV).
-const RESET_CODES: [u8; 5] = [0x04, 0x05, 0x06, 0x08, 0x0A];
-
-fn route(key: u8) -> Route {
-    if key == VCP_OUTPUT_RANGE {
-        return Route { code: VCP_INPUT_SOURCE, access: Access::Vendor, verify: true };
-    }
-    let access = if RESET_CODES.contains(&key) || PLAIN_CODES.contains(&key) {
-        Access::Plain
-    } else if key <= 0x1E {
-        Access::Table
-    } else {
-        Access::Vendor
-    };
-    let verify = !RESET_CODES.contains(&key)
-        && ![
-            VCP_NEW_CONTROL_VALUE,
-            0xB0,
-            VCP_VENDOR_FACTORY_RESET,
-            VCP_DPMS,
-            VCP_PIP_SWAP,
-            VCP_PIP_RESET,
-        ]
-        .contains(&key);
-    Route { code: key, access, verify }
-}
-
-/// Result of reading a written setting back.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Readback {
-    Confirmed,
-    /// The monitor reports another value (write lost, rejected or adjusted).
-    Differs(u16),
-    Unreadable,
-}
-
-/// Whether a write can be checked by reading the setting back (actions such as resets cannot).
-pub fn is_verifiable(key: u8) -> bool {
-    route(key).verify
-}
-
-/// Writes that are never sent: `0x22 = 0` and `0xF0` (values 1 and 2 turn the monitor off).
-fn check_write(key: u8, value: u16) -> io::Result<()> {
-    if (key == VCP_MODE && value == 0) || key == 0xF0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("VCP 0x{key:02X} = {value} is blocked"),
-        ));
-    }
-    Ok(())
-}
-
-
-impl MsiDdc {
-    pub fn open(path: &str) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let mut i2c = I2c::new(file);
-        i2c.smbus_set_slave_address(DDC_ADDR, false)?;
-        Ok(Self {
-            i2c,
-            last_request: None,
-            needs_settle: true,
-        })
-    }
-
-    /// Waits until `REQUEST_GAP` has passed since the previous request (reads and writes alike).
-    fn pace(&mut self) {
-        if let Some(last) = self.last_request
-            && let Some(wait) = REQUEST_GAP.checked_sub(last.elapsed())
-        {
-            thread::sleep(wait);
-        }
-        self.last_request = Some(Instant::now());
-    }
-
-    /// One SET VCP frame: `51 84 03 code hi lo chk`.
-    fn write_vcp_frame(&mut self, code: u8, value: u16) -> io::Result<()> {
-        let vh = (value >> 8) as u8;
-        let vl = (value & 0xFF) as u8;
-        let chk = DDC_DEST ^ DDC_SRC ^ 0x84 ^ 0x03 ^ code ^ vh ^ vl;
-        self.pace();
-        self.i2c.write_all(&[DDC_SRC, 0x84, 0x03, code, vh, vl, chk])
-    }
-
-    /// Sends a write the way the manufacturer's program does, without checking the result.
-    ///
-    /// Manufacturer and table registers: `SET 99 = value`, then `SET code = value`; plain MCCS registers:
-    /// `SET code = value`. An I/O error (usually a short outage of the monitor) is retried once.
-    pub fn send_vcp(&mut self, key: u8, value: u16) -> io::Result<()> {
-        check_write(key, value)?;
-        let route = route(key);
-        if let Err(error) = self.send_write(route, value) {
-            log!("[DDC] VCP 0x{:02X} write failed: {error}, retrying", route.code);
-            self.needs_settle = true;
-            thread::sleep(RETRY_WAIT);
-            return self.send_write(route, value);
-        }
-        Ok(())
-    }
-
-    /// Reads a written setting back (some time after the write, see `VERIFY_DELAY`).
-    pub fn verify_vcp(&mut self, key: u8, value: u16) -> Readback {
-        let route = route(key);
-        match self.read_register(route, 3) {
-            Ok(reply) => {
-                let current = route.value(reply);
-                if current == value { Readback::Confirmed } else { Readback::Differs(current) }
-            }
-            Err(error) => {
-                log!("[DDC] VCP 0x{:02X} verify read failed: {}", route.code, error.describe());
-                Readback::Unreadable
-            }
-        }
-    }
-
-    /// Writes a setting and waits for the read-back; a write whose read-back differs is sent once more.
-    /// Returns `Some(actual)` when the monitor reports a different value afterwards (rejected or adjusted),
-    /// `None` when the value is confirmed or cannot be read back. Used where the next step depends on the result.
-    pub fn set_vcp(&mut self, key: u8, value: u16) -> io::Result<Option<u16>> {
-        let mut actual = None;
-        for attempt in 0..2 {
-            self.send_vcp(key, value)?;
-            if !is_verifiable(key) {
-                return Ok(None);
-            }
-            thread::sleep(VERIFY_DELAY);
-            match self.verify_vcp(key, value) {
-                Readback::Confirmed | Readback::Unreadable => return Ok(None),
-                Readback::Differs(current) => actual = Some(current),
-            }
-            if attempt == 0 {
-                log!("[DDC] VCP 0x{key:02X} = {value} not confirmed (read {actual:?}), resending");
-            }
-        }
-        Ok(actual)
-    }
-
-    fn send_write(&mut self, route: Route, value: u16) -> io::Result<()> {
-        if self.needs_settle {
-            self.settle_ddc();
-        }
-        if route.access != Access::Plain {
-            self.write_vcp_frame(VCP_DDCCI_INIT, value)?;
-        }
-        self.write_vcp_frame(route.code, value)
-    }
-
-    /// Reads a setting from the register it lives in (see [`route`]), with validation and retries.
-    pub fn get_vcp_reply(&mut self, key: u8) -> io::Result<VcpReply> {
-        let route = route(key);
-        self.read_register(route, READ_TRIES)
-            .map_err(|error| io::Error::other(format!("VCP 0x{:02X}: {}", route.code, error.describe())))
-    }
-
-    pub fn get_vcp(&mut self, key: u8) -> io::Result<u16> {
-        let route = route(key);
-        self.get_vcp_reply(key).map(|reply| route.value(reply))
-    }
-
-    /// Plain register of 0x52 (MCCS Active control): code of the setting changed last. The register after
-    /// `GET 99` is the audio source ([`VCP_AUDIO_SOURCE`]).
-    fn get_active_control(&mut self) -> io::Result<u8> {
-        let route = Route { code: 0x52, access: Access::Plain, verify: false };
-        self.read_register(route, READ_TRIES)
-            .map(|reply| reply.current as u8)
-            .map_err(|error| io::Error::other(format!("VCP 0x52: {}", error.describe())))
-    }
-
-    fn read_register(&mut self, route: Route, tries: usize) -> Result<VcpReply, FrameError> {
-        let mut last = FrameError::Garbage;
-        for _ in 0..tries {
-            if self.needs_settle {
-                self.settle_ddc();
-            }
-            match self.read_register_once(route) {
-                Ok(reply) => return Ok(reply),
-                // "Unsupported" is sometimes transient; it does not disturb the bus.
-                Err(FrameError::Unsupported) => {
-                    last = FrameError::Unsupported;
-                    thread::sleep(UNSUPPORTED_WAIT);
-                }
-                Err(error) => {
-                    last = error;
-                    self.needs_settle = true;
-                    thread::sleep(RETRY_WAIT);
-                }
-            }
-        }
-        Err(last)
-    }
-
-    fn read_register_once(&mut self, route: Route) -> Result<VcpReply, FrameError> {
-        if route.access != Access::Vendor {
-            return self.get_vcp_frame(route.code);
-        }
-        let init = self.get_vcp_frame(VCP_DDCCI_INIT)?;
-        if init.maximum != 0xFAFA || init.current != 0xFAFA {
-            return Err(FrameError::Garbage);
-        }
-        let reply = self.get_vcp_frame(route.code)?;
-        if route.code == VCP_MODE {
-            // GET 99 -> GET 22 -> GET 00..1E would read a profile table: close the sequence.
-            let _ = self.get_vcp_frame(VCP_VERSION);
-        }
-        Ok(reply)
-    }
-
-    /// One request/reply exchange with strict validation (header, checksum, code, status).
-    fn get_vcp_frame(&mut self, code: u8) -> Result<VcpReply, FrameError> {
-        let chk = DDC_DEST ^ DDC_SRC ^ 0x82 ^ 0x01 ^ code;
-        self.pace();
-        self.i2c
-            .write_all(&[DDC_SRC, 0x82, 0x01, code, chk])
-            .map_err(FrameError::Io)?;
-        thread::sleep(REPLY_DELAY);
-
-        let mut resp = [0u8; 11];
-        self.i2c.read_exact(&mut resp).map_err(FrameError::Io)?;
-
-        if resp[..3] == [0x6E, 0x80, 0xBE] {
-            return Err(FrameError::Null);
-        }
-        let checksum = resp.iter().fold(0x50u8, |acc, byte| acc ^ byte);
-        if resp[..3] != [0x6E, 0x88, 0x02] || checksum != 0 || resp[4] != code {
-            return Err(FrameError::Garbage);
-        }
-        if resp[3] != 0 {
-            return Err(FrameError::Unsupported);
-        }
-        Ok(VcpReply {
-            maximum: ((resp[6] as u16) << 8) | resp[7] as u16,
-            current: ((resp[8] as u16) << 8) | resp[9] as u16,
-        })
-    }
-
-    /// Plain GET 0xDF until two consecutive valid replies. Leaves a wedged stream or an outage.
-    /// DF (VCP version) is used because codes 00-1E right after GET 99 -> GET 22 start a table stream.
-    fn settle_ddc(&mut self) -> bool {
-        let mut good = 0;
-        for _ in 0..30 {
-            match self.get_vcp_frame(VCP_VERSION) {
-                Ok(_) => {
-                    good += 1;
-                    if good == 2 {
-                        self.needs_settle = false;
-                        return true;
-                    }
-                }
-                Err(_) => good = 0,
-            }
-        }
-        false
-    }
-
-    /// Reads the active profile. A Custom profile comes with its table, returned only after
-    /// `TABLE_CONFIRMATIONS` identical reads. The profile is the one the monitor reports in the GET 0x22 reply
-    /// of the table sequence.
-    pub fn read_active_profile(&mut self, confirmations: usize) -> io::Result<ActiveProfile> {
-        let deadline = Instant::now() + TABLE_BUDGET;
-        let mut previous: Option<(u8, [u8; PROFILE_TABLE_CHUNKS * 4])> = None;
-        let mut matches = 1;
-        let mut attempts = 0;
-        let mut last_error = String::from("no attempt made");
-
-        while Instant::now() < deadline {
-            attempts += 1;
-            match self.read_profile_table_once() {
-                Ok(TableRead::Default(scene_id)) => return Ok(ActiveProfile::Default(scene_id)),
-                Ok(TableRead::Table(scene_id, data)) if confirmations <= 1 || previous == Some((scene_id, data)) => {
-                    matches += 1;
-                    if matches >= confirmations {
-                        let mut bytes = [0u8; PROFILE_TABLE_LEN];
-                        for (slot, value) in bytes.iter_mut().skip(2).zip(data.iter()) {
-                            *slot = *value;
-                        }
-                        return Ok(ActiveProfile::Custom(ProfileTable { scene_id, bytes }));
-                    }
-                }
-                Ok(TableRead::Table(scene_id, data)) => {
-                    previous = Some((scene_id, data));
-                    matches = 1;
-                }
-                Err(error) => {
-                    previous = None;
-                    matches = 1;
-                    last_error = error;
-                }
-            }
-            thread::sleep(Duration::from_millis(500));
-        }
-
-        Err(io::Error::other(format!(
-            "profile table read failed after {attempts} attempts: {last_error}"
-        )))
-    }
-
-    /// GET 99 -> GET 22 -> GET profile -> GET FE ... -> 0000/5101, with recovery of lost replies:
-    /// NULL leaves the fragment unread (repeat the request), garbage consumes it (FF resends it).
-    /// Only Custom profiles (even codes) are read as tables: the manufacturer's program reads only those, and the
-    /// stream of a Default profile has a different length (9 fragments for Standard Default) and an unknown layout.
-    fn read_profile_table_once(&mut self) -> Result<TableRead, String> {
-        let mut entered = false;
-        for _ in 0..8 {
-            if !self.settle_ddc() {
-                continue;
-            }
-            match self.get_vcp_frame(VCP_DDCCI_INIT) {
-                Ok(reply) if reply.maximum == 0xFAFA && reply.current == 0xFAFA => {
-                    entered = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        if !entered {
-            return Err("GET 0x99 did not return FAFA/FAFA".into());
-        }
-
-        let mode = self
-            .get_vcp_frame(VCP_MODE)
-            .map_err(|error| format!("GET 0x22: {}", error.describe()))?;
-        if mode.maximum != 0x0026 {
-            return Err(format!("GET 0x22: unexpected maximum 0x{:04X}", mode.maximum));
-        }
-
-        let scene_id = u8::try_from(mode.current)
-            .ok()
-            .filter(|id| (1..=30).contains(id))
-            .ok_or_else(|| format!("GET 0x22: unknown profile {}", mode.current))?;
-        if !is_custom_profile(scene_id) {
-            // Close the sequence: GET 00..1E right after GET 99 -> GET 22 would start a table stream.
-            let _ = self.get_vcp_frame(VCP_VERSION);
-            return Ok(TableRead::Default(scene_id));
-        }
-
-        let mut chunks: Vec<[u8; 4]> = Vec::with_capacity(PROFILE_TABLE_CHUNKS);
-        let mut code = scene_id;
-        loop {
-            let reply = self.next_table_chunk(code, chunks.len())?;
-            let chunk = [
-                (reply.maximum >> 8) as u8,
-                reply.maximum as u8,
-                (reply.current >> 8) as u8,
-                reply.current as u8,
-            ];
-            code = VCP_FIRMWARE;
-            if !chunks.is_empty() && chunk == [0, 0, 0x51, 0x01] {
-                break;
-            }
-            if chunks.len() >= PROFILE_TABLE_CHUNKS {
-                return Err("table stream did not end".into());
-            }
-            chunks.push(chunk);
-        }
-        if chunks.len() != PROFILE_TABLE_CHUNKS {
-            return Err(format!("table has {} fragments instead of {}", chunks.len(), PROFILE_TABLE_CHUNKS));
-        }
-
-        let mut data = [0u8; PROFILE_TABLE_CHUNKS * 4];
-        for (index, chunk) in chunks.iter().enumerate() {
-            data[index * 4..index * 4 + 4].copy_from_slice(chunk);
-        }
-        Ok(TableRead::Table(scene_id, data))
-    }
-
-    fn next_table_chunk(&mut self, code: u8, received: usize) -> Result<VcpReply, String> {
-        let mut request = code;
-        let mut error = match self.get_vcp_frame(request) {
-            Ok(reply) => return Ok(reply),
-            Err(error) => error,
-        };
-        for _ in 0..TABLE_RESEND_TRIES {
-            thread::sleep(TABLE_RESEND_WAIT);
-            if !matches!(error, FrameError::Null) {
-                request = VCP_RESEND;
-            }
-            match self.get_vcp_frame(request) {
-                // FF outside a stream answers 0000/0200: the lost reply was the 0000/5101 terminator.
-                Ok(reply)
-                    if request == VCP_RESEND
-                        && reply.maximum == 0
-                        && reply.current == 0x0200 =>
-                {
-                    if received == PROFILE_TABLE_CHUNKS {
-                        return Ok(VcpReply { maximum: 0, current: 0x5101 });
-                    }
-                    return Err(format!("stream ended after {received} fragments"));
-                }
-                Ok(reply) => return Ok(reply),
-                Err(next) => error = next,
-            }
-        }
-        Err(format!("fragment {received}: {}", error.describe()))
-    }
-}
-
+#[derive(Clone)]
 pub struct MonitorInfo {
     pub name: String,
     pub connector: String,
@@ -797,9 +261,15 @@ pub enum WorkerCmd {
     RefreshAll,
     /// Firmware 2025-09-20 keeps Adaptive-Sync on in DyDs profiles; older firmware needs it off first.
     DydsWithAdaptiveSync(bool),
+    /// Chooses the monitor that the following commands act on. Handled by the session router, never by a worker.
+    SelectMonitor(MonitorId),
 }
 
 pub enum UiCmd {
+    /// The monitor answers again (`true`) or its connection is gone (`false`, e.g. the cable was pulled).
+    Responding(bool),
+    /// The monitors that will be connected (sent first, so the UI can list them before they answer).
+    Detected(Vec<MonitorId>),
     MonitorFound(MonitorInfo),
     /// Values read from the monitor.
     Settings(HashMap<u8, u16>),
@@ -812,31 +282,6 @@ pub enum UiCmd {
     InfoRefreshed { hz: Option<u16>, usage_mins: Option<u16> },
     Progress(String),
     Error(String),
-}
-
-fn worker_cmd_code(cmd: &WorkerCmd) -> Option<u8> {
-    match cmd {
-        WorkerCmd::Set(code, _) => Some(*code),
-        WorkerCmd::ReadUsageTime | WorkerCmd::RefreshAll | WorkerCmd::DydsWithAdaptiveSync(_) => None,
-    }
-}
-
-fn collapse_worker_cmds(mut batch: Vec<WorkerCmd>) -> Vec<WorkerCmd> {
-    let mut seen = HashSet::new();
-    let mut collapsed = Vec::with_capacity(batch.len());
-
-    while let Some(cmd) = batch.pop() {
-        let Some(code) = worker_cmd_code(&cmd) else {
-            collapsed.push(cmd);
-            continue;
-        };
-        if seen.insert(code) {
-            collapsed.push(cmd);
-        }
-    }
-
-    collapsed.reverse();
-    collapsed
 }
 
 pub const COLOR_TEMP_VALUES: [u16; 6] = [0x05, 0x06, 0x08, 0x0b, 0x0c, 0x0d];
@@ -1178,15 +623,13 @@ fn normalize_monitor_name(name: &str) -> String {
         .to_string()
 }
 
+#[cfg(unix)]
 fn get_edid_name(path: &str) -> Option<String> {
-    let file = File::open(path).ok()?;
-    let mut i2c = I2c::new(file);
-    i2c.smbus_set_slave_address(0x50, false).ok()?;
-    let mut data = [0u8; 128];
-    i2c.read_exact(&mut data).ok()?;
+    let data = crate::platform::linux::read_edid_block(path)?;
     parse_edid_name(&data[..])
 }
 
+#[cfg(unix)]
 fn read_drm_resolution(path: &Path) -> String {
     for file_name in ["mode", "modes"] {
         if let Ok(contents) = fs::read_to_string(path.join(file_name))
@@ -1314,6 +757,47 @@ fn parse_cosmic_randr_list(text: &str) -> Vec<CosmicOutputState> {
 }
 
 pub fn query_system_display_state(preferred_output: Option<&str>) -> io::Result<SystemDisplayState> {
+    #[cfg(windows)]
+    return query_windows_display_state(preferred_output);
+    #[cfg(not(windows))]
+    query_linux_display_state(preferred_output)
+}
+
+/// Windows: the real current mode, supported modes and scaling (changing them is in `set_windows_display_mode`).
+#[cfg(windows)]
+fn query_windows_display_state(preferred_output: Option<&str>) -> io::Result<SystemDisplayState> {
+    let (device, info) = crate::platform::windows::query_display_modes(preferred_output)
+        .ok_or_else(|| io::Error::other("The display mode of this screen could not be read."))?;
+    let resolution = |(w, h, _): crate::platform::windows::DisplayMode| format!("{w}x{h}");
+    let refresh = |(_, _, hz): crate::platform::windows::DisplayMode| format!("{:.3}", hz as f64);
+    let mut modes = info.modes.clone();
+    // Largest resolution first, then the highest refresh rate, as on Linux.
+    modes.sort_by(|a, b| (b.0 * b.1).cmp(&(a.0 * a.1)).then(b.2.cmp(&a.2)));
+    let mut available_resolutions: Vec<String> = Vec::new();
+    let mut refresh_rates: HashMap<String, Vec<String>> = HashMap::new();
+    for mode in modes {
+        let key = resolution(mode);
+        if !available_resolutions.contains(&key) {
+            available_resolutions.push(key.clone());
+        }
+        refresh_rates.entry(key).or_default().push(refresh(mode));
+    }
+    Ok(SystemDisplayState {
+        output: device,
+        current_resolution: resolution(info.current),
+        current_refresh: refresh(info.current),
+        current_scale_percent: info.scale_percent,
+        available_resolutions,
+        refresh_rates,
+        // Windows has no public call to set the scaling.
+        scaling_options: vec![info.scale_percent],
+        hdr: None,
+        screen_index: None,
+    })
+}
+
+#[cfg(not(windows))]
+fn query_linux_display_state(preferred_output: Option<&str>) -> io::Result<SystemDisplayState> {
     // sysfs reports card1-DP-3; compositors use DP-3.
     let preferred_output = preferred_output.map(|name| {
         match name.split_once('-') {
@@ -1412,6 +896,14 @@ pub fn query_system_display_state(preferred_output: Option<&str>) -> io::Result<
 
 /// Turns HDR of the output on or off in the compositor (KDE Wayland only).
 pub fn set_system_hdr(output_name: &str, enable: bool) -> io::Result<()> {
+    #[cfg(windows)]
+    return crate::platform::windows::set_hdr(output_name, enable).map_err(io::Error::other);
+    #[cfg(not(windows))]
+    set_system_hdr_linux(output_name, enable)
+}
+
+#[cfg(not(windows))]
+fn set_system_hdr_linux(output_name: &str, enable: bool) -> io::Result<()> {
     if current_session_is_kde_wayland() {
         return kde::set_hdr(output_name, enable);
     }
@@ -1427,6 +919,62 @@ pub fn system_wallpaper(state: &SystemDisplayState) -> Option<std::path::PathBuf
 }
 
 pub fn set_system_display_mode(
+    output_name: &str,
+    resolution: &str,
+    refresh: Option<&str>,
+    scale_percent: Option<u16>,
+) -> io::Result<()> {
+    #[cfg(windows)]
+    return set_windows_display_mode(output_name, resolution, refresh, scale_percent);
+    #[cfg(not(windows))]
+    set_other_display_mode(output_name, resolution, refresh, scale_percent)
+}
+
+/// Windows: changes the resolution and refresh rate of ONE display (tested with the driver first, not saved until the
+/// user keeps it; the caller asks and reverts). Scaling has no public call: it is only compared with the current.
+#[cfg(windows)]
+fn set_windows_display_mode(
+    output_name: &str,
+    resolution: &str,
+    refresh: Option<&str>,
+    scale_percent: Option<u16>,
+) -> io::Result<()> {
+    let (width, height) = resolution
+        .split_once('x')
+        .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid resolution format"))?;
+    let (_, current) = crate::platform::windows::query_display_modes(Some(output_name))
+        .ok_or_else(|| io::Error::other("The display mode of this screen could not be read."))?;
+    if scale_percent.is_some_and(|scale| scale != current.scale_percent) {
+        return Err(io::Error::other("The scaling can only be changed in the Windows display settings."));
+    }
+    let hz = match refresh {
+        Some(text) => text.parse::<f64>().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid refresh rate"))?.round() as u32,
+        None => current.current.2,
+    };
+    crate::platform::windows::apply_display_mode(output_name, (width, height, hz), false).map_err(io::Error::other)
+}
+
+/// Windows: keeps the mode that is shown now (writes it to the registry).
+#[cfg(windows)]
+pub fn keep_system_display_mode(output_name: &str) -> io::Result<()> {
+    crate::platform::windows::persist_current_display_mode(output_name).map_err(io::Error::other)
+}
+
+/// Windows: returns the display to its saved mode.
+#[cfg(windows)]
+pub fn revert_system_display_mode(output_name: &str) -> io::Result<()> {
+    crate::platform::windows::revert_display_mode(output_name).map_err(io::Error::other)
+}
+
+/// HDR of one display in Windows: `(supported, enabled)`.
+#[cfg(windows)]
+pub fn windows_hdr_state(output_name: &str) -> Option<(bool, bool)> {
+    crate::platform::windows::hdr_state(output_name)
+}
+
+#[cfg(not(windows))]
+fn set_other_display_mode(
     output_name: &str,
     resolution: &str,
     refresh: Option<&str>,
@@ -1478,6 +1026,7 @@ pub fn set_system_display_mode(
     }
 }
 
+#[cfg(unix)]
 fn get_drm_monitors() -> Vec<DrmMonitorInfo> {
     let mut monitors = Vec::new();
     let drm_dir = Path::new("/sys/class/drm");
@@ -1521,6 +1070,7 @@ fn get_drm_monitors() -> Vec<DrmMonitorInfo> {
     monitors
 }
 
+#[cfg(unix)]
 fn get_edid_name_retry(path: &str, attempts: u8) -> Option<String> {
     for attempt in 0..attempts {
         if let Some(name) = get_edid_name(path) {
@@ -1533,239 +1083,45 @@ fn get_edid_name_retry(path: &str, attempts: u8) -> Option<String> {
     None
 }
 
-/// Reads one setting (validated, with retries inside [`MsiDdc::get_vcp`]); `None` when it cannot be read.
-fn read_vcp(ddc: &mut MsiDdc, key: u8) -> Option<u16> {
-    match ddc.get_vcp(key) {
-        Ok(value) => Some(value),
-        Err(error) => {
-            log!("[DDC] {error}");
-            None
-        }
-    }
+/// Opens the DDC/CI transport of `path` (an I2C device on Linux, `\.DISPLAYn` on Windows).
+#[cfg(unix)]
+fn open_ddc(path: &str) -> io::Result<MsiDdc> {
+    MsiDdc::open(path)
 }
 
-/// Waits until the monitor answers plain requests again (start of a session, after an outage).
-fn wake_ddc(ddc: &mut MsiDdc) -> bool {
-    ddc.settle_ddc()
-}
-
-fn load_cached_settings(name: &str, ui_tx: &async_channel::Sender<UiCmd>) -> HashMap<u8, u16> {
-    let _ = ui_tx.send_blocking(UiCmd::Progress("Loading cached settings...".into()));
-    load_cache_for(name)
-}
-
-// -----------------------------------------------------------------------------
-// Cache helpers
-// -----------------------------------------------------------------------------
-
-#[derive(Clone, Default, Serialize, Deserialize)]
-struct CachedMonitorSnapshot {
-    resolution: String,
-    hz: u16,
-    serial_number: String,
-    firm: String,
-    usage_mins: u16,
-}
-
-#[derive(Default, Serialize, Deserialize)]
-struct CacheStore {
-    monitors: HashMap<String, HashMap<u8, u16>>,
-    color_profiles: HashMap<String, HashMap<u16, HashMap<u8, u16>>>,
-    snapshots: HashMap<String, CachedMonitorSnapshot>,
-    last_monitor: Option<String>,
-    last_i2c_path: Option<String>,
-}
-
-fn cache_file() -> PathBuf {
-    if let Ok(cfg) = std::env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(cfg)
-            .join("titan_control")
-            .join("settings_cache.json")
-    } else if let Some(home) = dirs::home_dir() {
-        home.join(".config")
-            .join("titan_control")
-            .join("settings_cache.json")
-    } else {
-        PathBuf::from("./settings_cache.json")
-    }
-}
-
-fn load_cache_store() -> CacheStore {
-    let path = cache_file();
-    if let Ok(data) = fs::read_to_string(&path)
-        && let Ok(store) = serde_json::from_str(&data)
-    {
-        return store;
-    }
-    CacheStore::default()
-}
-
-fn load_cache_for(name: &str) -> HashMap<u8, u16> {
-    load_cache_store()
-        .monitors
-        .get(name)
-        .cloned()
-        .unwrap_or_default()
-}
-
-pub fn load_color_temp_profile_cache(name: &str, color_temp: u16) -> HashMap<u8, u16> {
-    load_cache_store()
-        .color_profiles
-        .get(name)
-        .and_then(|profiles| profiles.get(&color_temp))
-        .cloned()
-        .unwrap_or_default()
-}
-
-fn load_cached_snapshot(name: &str) -> Option<CachedMonitorSnapshot> {
-    load_cache_store().snapshots.get(name).cloned()
-}
-
-pub fn load_last_monitor_name() -> Option<String> {
-    load_cache_store().last_monitor
-}
-
-fn load_last_i2c_path() -> Option<String> {
-    load_cache_store().last_i2c_path
-}
-
-fn save_cache_for(name: &str, map: &HashMap<u8, u16>, i2c_path: Option<&str>) {
-    let path = cache_file();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let mut store = load_cache_store();
-    store.monitors.insert(name.to_string(), map.clone());
-    store.last_monitor = Some(name.to_string());
-    if let Some(i2c_path) = i2c_path {
-        store.last_i2c_path = Some(i2c_path.to_string());
-    }
-    if let Ok(data) = serde_json::to_string_pretty(&store) {
-        let _ = fs::write(&path, data);
-    }
-}
-
-fn save_color_temp_profile_cache(
-    name: &str,
-    color_temp: u16,
-    map: &HashMap<u8, u16>,
-    i2c_path: Option<&str>,
-) {
-    let path = cache_file();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let mut store = load_cache_store();
-    store
-        .color_profiles
-        .entry(name.to_string())
-        .or_default()
-        .insert(color_temp, map.clone());
-    store.last_monitor = Some(name.to_string());
-    if let Some(i2c_path) = i2c_path {
-        store.last_i2c_path = Some(i2c_path.to_string());
-    }
-    if let Ok(data) = serde_json::to_string_pretty(&store) {
-        let _ = fs::write(&path, data);
-    }
-}
-
-fn clear_color_temp_profile_cache(name: &str) {
-    let path = cache_file();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let mut store = load_cache_store();
-    store.color_profiles.remove(name);
-    store.last_monitor = Some(name.to_string());
-    if let Ok(data) = serde_json::to_string_pretty(&store) {
-        let _ = fs::write(&path, data);
-    }
-}
-
-fn save_cached_snapshot(name: &str, snapshot: CachedMonitorSnapshot, i2c_path: Option<&str>) {
-    let path = cache_file();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let mut store = load_cache_store();
-    store.snapshots.insert(name.to_string(), snapshot);
-    store.last_monitor = Some(name.to_string());
-    if let Some(i2c_path) = i2c_path {
-        store.last_i2c_path = Some(i2c_path.to_string());
-    }
-    if let Ok(data) = serde_json::to_string_pretty(&store) {
-        let _ = fs::write(&path, data);
-    }
-}
-
-fn update_cached_snapshot_usage_time(name: &str, usage_mins: u16) {
-    let path = cache_file();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let mut store = load_cache_store();
-    if let Some(snapshot) = store.snapshots.get_mut(name) {
-        snapshot.usage_mins = usage_mins;
-        if let Ok(data) = serde_json::to_string_pretty(&store) {
-            let _ = fs::write(&path, data);
-        }
-    }
-}
-
-fn apply_color_temp_cache(name: &str, settings: &mut HashMap<u8, u16>) {
-    let Some(&color_temp) = settings.get(&VCP_COLOR_TEMP) else {
-        return;
-    };
-
-    if let Some((red, green, blue)) = builtin_color_temp_rgb(color_temp) {
-        settings.insert(VCP_RED, red);
-        settings.insert(VCP_GREEN, green);
-        settings.insert(VCP_BLUE, blue);
-        return;
-    }
-
-    if is_user_color_temp(color_temp) {
-        for (code, value) in load_color_temp_profile_cache(name, color_temp) {
-            settings.insert(code, value);
-        }
-    }
-}
-
-fn persist_active_color_temp_profile(
-    name: &str,
-    settings: &HashMap<u8, u16>,
-    i2c_path: Option<&str>,
-) {
-    let Some(&color_temp) = settings.get(&VCP_COLOR_TEMP) else {
-        return;
-    };
-
-    if !is_user_color_temp(color_temp) {
-        return;
-    }
-
-    let mut profile = load_color_temp_profile_cache(name, color_temp);
-    for code in [VCP_RED, VCP_GREEN, VCP_BLUE] {
-        if let Some(&value) = settings.get(&code) {
-            profile.insert(code, value);
-        }
-    }
-    save_color_temp_profile_cache(name, color_temp, &profile, i2c_path);
+#[cfg(windows)]
+fn open_ddc(path: &str) -> io::Result<MsiDdc> {
+    let transport = crate::platform::windows::open_transport(path)?;
+    // One lock for the whole bus: exchanges of different monitors never interleave.
+    let mut ddc = MsiDdc::new(Box::new(transport::BusLocked::new(transport, transport::global_bus())));
+    // Writes follow the level chosen in the window (0 = read-only at every start), and never the advanced
+    // write level (resets and the like).
+    ddc.set_level_source(user_write_level_source());
+    ddc.set_write_level(WriteLevel::Normal);
+    // The first write after connecting checks that the handle still belongs to the same monitor.
+    let path = path.to_string();
+    let expected = crate::platform::windows::current_identity(&path).map_err(io::Error::other)?;
+    ddc.set_identity_guard(Box::new(move || {
+        let now = crate::platform::windows::current_identity(&path)?;
+        if now == expected { Ok(()) } else { Err(format!("{} is now {}, expected {}", path, now.label(), expected.label())) }
+    }));
+    Ok(ddc)
 }
 
 fn try_connect(
     dev_path: &str,
     name: &str,
+    // Key of the settings cache: the monitor name on Linux, the full `MonitorId` key on Windows.
+    cache_key: &str,
     drm_info: Option<&DrmMonitorInfo>,
     ui_tx: &async_channel::Sender<UiCmd>,
 ) -> Option<(MsiDdc, MonitorInfo, bool)> {
-    let mut ddc = match MsiDdc::open(dev_path) {
+    let mut ddc = match open_ddc(dev_path) {
         Ok(d) => d,
         Err(e) => {
             log!("[DDC] {} open failed: {}, retrying...", dev_path, e);
             thread::sleep(Duration::from_millis(200));
-            match MsiDdc::open(dev_path) {
+            match open_ddc(dev_path) {
                 Ok(d) => d,
                 Err(e) => {
                     log!("[DDC] {} retry failed: {}", dev_path, e);
@@ -1782,7 +1138,7 @@ fn try_connect(
     }
 
     log!("[DDC] Monitor ready on {}: {}", dev_path, name);
-    let cached_snapshot = load_cached_snapshot(name);
+    let cached_snapshot = load_cached_snapshot(cache_key);
 
     // The signal can change between sessions, so the refresh rate is always read (plain, cheap).
     let hz = read_vcp(&mut ddc, VCP_REFRESH_RATE)
@@ -1798,7 +1154,7 @@ fn try_connect(
 
     // Cached values are shown at once; the worker then reads every setting from the monitor
     // (see `startup_read_keys`), so the cache is only a fast first draft.
-    let mut settings = load_cached_settings(name, ui_tx);
+    let mut settings = load_cached_settings(cache_key, ui_tx);
     let _ = ui_tx.send_blocking(UiCmd::Progress("Reading picture profile...".to_string()));
     let table_read = match ddc.read_active_profile(TABLE_CONFIRMATIONS) {
         Ok(ActiveProfile::Custom(table)) => {
@@ -1817,8 +1173,8 @@ fn try_connect(
             false
         }
     };
-    apply_color_temp_cache(name, &mut settings);
-    save_cache_for(name, &settings, Some(dev_path));
+    apply_color_temp_cache(cache_key, &mut settings);
+    save_cache_for(cache_key, &settings, Some(dev_path));
 
     let resolution = drm_info
         .map(|info| info.resolution.clone())
@@ -1852,7 +1208,7 @@ fn try_connect(
     };
 
     save_cached_snapshot(
-        name,
+        cache_key,
         CachedMonitorSnapshot {
             resolution: info.resolution.clone(),
             hz: info.hz,
@@ -1866,7 +1222,268 @@ fn try_connect(
     Some((ddc, info, table_read))
 }
 
-pub fn start_worker(worker_rx: mpsc::Receiver<WorkerCmd>, ui_tx: async_channel::Sender<UiCmd>) {
+/// Safe mode: no access to the monitor hardware at all (UI work, CI). Set by `--no-ddc` or `TITAN_NO_DDC=1`.
+static NO_DDC: AtomicBool = AtomicBool::new(false);
+
+pub fn set_no_ddc(enabled: bool) {
+    NO_DDC.store(enabled, Ordering::Relaxed);
+}
+
+pub fn no_ddc() -> bool {
+    NO_DDC.load(Ordering::Relaxed)
+}
+
+/// Id used for events that belong to no particular monitor (progress, "no monitor found") and by Linux, which
+/// has always driven a single monitor.
+fn system_id() -> MonitorId {
+    MonitorId::legacy("monitor")
+}
+
+/// Windows: writes follow a level the user chooses in the window (0 = read-only, the default at every start). Linux has
+/// never had such a limit.
+pub fn write_policy_active() -> bool {
+    cfg!(windows)
+}
+
+/// The write level shared by the window and every session. Changing it takes effect at the next write attempt, so
+/// setting it to 0 is an immediate emergency stop.
+pub fn user_write_level_source() -> Arc<AtomicU8> {
+    static LEVEL: OnceLock<Arc<AtomicU8>> = OnceLock::new();
+    LEVEL.get_or_init(|| Arc::new(AtomicU8::new(0))).clone()
+}
+
+pub fn set_user_write_level(level: u8) {
+    user_write_level_source().store(level.min(3), Ordering::SeqCst);
+    log!("[DDC] write level: {}", level.min(3));
+}
+
+pub fn user_write_level() -> u8 {
+    user_write_level_source().load(Ordering::SeqCst)
+}
+
+/// Whether a write of `code` is allowed at `level` (see [`write_class`]).
+/// Experimental (Windows, write level 2+): the settings of a Default profile are offered for writing as well. The
+/// monitor keeps factory values there per its documentation, so such a write may be ignored; read-back shows what
+/// really happened.
+pub fn default_profile_unlocked() -> bool {
+    write_policy_active() && user_write_level() >= 2
+}
+
+pub fn write_allowed(code: u8, level: u8) -> bool {
+    write_class(code).is_some_and(|required| required <= level)
+}
+
+pub fn start_worker(worker_rx: mpsc::Receiver<WorkerCmd>, events: async_channel::Sender<SessionEvent>) {
+    #[cfg(debug_assertions)]
+    if fake_monitors(&events) {
+        thread::spawn(move || while worker_rx.recv().is_ok() {});
+        return;
+    }
+    if no_ddc() {
+        log!("[DDC] Safe mode (--no-ddc): the monitor is not accessed");
+        thread::spawn(move || {
+            let _ = events.send_blocking(SessionEvent { monitor: system_id(), cmd: UiCmd::Error("Monitor not found".into()) });
+            drop(worker_rx);
+        });
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let (ui_tx, ui_rx) = async_channel::unbounded::<UiCmd>();
+        thread::spawn(move || forward_tagged(system_id(), ui_rx, events, None));
+        start_worker_hw(worker_rx, ui_tx);
+    }
+    #[cfg(windows)]
+    start_sessions(worker_rx, events);
+}
+
+/// True when the EDID names a P275MV: the only monitors that ever receive DDC traffic.
+pub(crate) fn edid_is_p275mv(edid: &[u8]) -> bool {
+    parse_edid_name(edid).is_some_and(|name| name.contains("P275MV"))
+}
+
+/// A P275MV found by the enumeration, with everything a session needs (plain data, so it can move to a thread).
+#[cfg(windows)]
+struct SessionTarget {
+    device: String,
+    id: MonitorId,
+    drm: DrmMonitorInfo,
+}
+
+/// The P275MV monitors Windows currently shows (other monitors are never touched).
+#[cfg(windows)]
+fn enumerate_targets() -> Vec<SessionTarget> {
+    let mut targets = Vec::new();
+    for display in crate::platform::windows::enumerate_displays() {
+        let Some(edid) = display.edid.as_deref() else { continue };
+        if !edid_is_p275mv(edid) {
+            continue;
+        }
+        let path = display.registry_key.clone().unwrap_or_default();
+        let Some(id) = identity::from_edid(edid, &path) else { continue };
+        targets.push(SessionTarget {
+            device: display.device.clone(),
+            drm: DrmMonitorInfo {
+                name: id.name.clone(),
+                resolution: display.resolution(),
+                serial_number: id.serial.clone(),
+                connector: display.device.clone(),
+            },
+            id,
+        });
+    }
+    targets
+}
+
+/// What the session thread waits for.
+#[cfg(windows)]
+enum SessionMsg {
+    Command(WorkerCmd),
+    /// Something about the displays changed (or it is time to look): enumerate again.
+    Rescan,
+}
+
+/// How often the displays are enumerated even when Windows reported nothing (missed messages are harmless).
+#[cfg(windows)]
+const RESCAN_INTERVAL: Duration = Duration::from_secs(5);
+/// Display changes come in bursts; the monitors are enumerated once this long after the last message.
+#[cfg(windows)]
+const RESCAN_SETTLE: Duration = Duration::from_millis(600);
+
+/// Windows: one session per P275MV. Every session reports to the UI with its own id; commands from the UI go to the
+/// monitor chosen with `WorkerCmd::SelectMonitor` (see [`Router`]). A monitor that appears, disappears or comes back
+/// (cable, sleep, another port) is noticed from the display-change messages of Windows: its session is started or
+/// replaced, the others are left alone.
+#[cfg(windows)]
+fn start_sessions(worker_rx: mpsc::Receiver<WorkerCmd>, events: async_channel::Sender<SessionEvent>) {
+    thread::spawn(move || {
+        let system_events = events.clone();
+        let system = move |cmd: UiCmd| {
+            let _ = system_events.send_blocking(SessionEvent { monitor: system_id(), cmd });
+        };
+        system(UiCmd::Progress("Detecting monitors...".into()));
+        let targets = enumerate_targets();
+        for target in &targets {
+            log!("[WIN] {} EDID: {}", target.device, target.id.label());
+        }
+        if targets.is_empty() {
+            log!("[DDC] No compatible monitor found");
+            system(UiCmd::Error("Monitor not found".into()));
+            return;
+        }
+        let ids: Vec<MonitorId> = targets.iter().map(|target| target.id.clone()).collect();
+        migrate_legacy_cache(&ids);
+        // The UI lists the monitors before they answer.
+        let _ = events.send_blocking(SessionEvent { monitor: ids[0].clone(), cmd: UiCmd::Detected(ids) });
+
+        let mut router = Router::new(SessionManager::default());
+        for target in targets {
+            start_session(&mut router, target, &events);
+        }
+
+        // One queue for the commands of the UI and the display changes.
+        let (msg_tx, msg_rx) = mpsc::channel::<SessionMsg>();
+        let commands = msg_tx.clone();
+        thread::spawn(move || {
+            while let Ok(cmd) = worker_rx.recv() {
+                if commands.send(SessionMsg::Command(cmd)).is_err() {
+                    break;
+                }
+            }
+        });
+        let (change_tx, change_rx) = mpsc::channel::<()>();
+        crate::platform::windows::spawn_display_watcher(change_tx);
+        let changes = msg_tx.clone();
+        thread::spawn(move || {
+            while change_rx.recv().is_ok() {
+                // Wait until the burst is over, then ask for one scan.
+                while change_rx.recv_timeout(RESCAN_SETTLE).is_ok() {}
+                if changes.send(SessionMsg::Rescan).is_err() {
+                    break;
+                }
+            }
+        });
+
+        loop {
+            match msg_rx.recv_timeout(RESCAN_INTERVAL) {
+                Ok(SessionMsg::Command(cmd)) => router.on_command(cmd),
+                Ok(SessionMsg::Rescan) | Err(mpsc::RecvTimeoutError::Timeout) => rescan(&mut router, &events),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    });
+}
+
+/// Starts (or restarts) the session of `target` and puts it under the router.
+#[cfg(windows)]
+fn start_session(router: &mut Router, target: SessionTarget, events: &async_channel::Sender<SessionEvent>) {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
+    let dead = std::sync::Arc::new(AtomicBool::new(false));
+    router.manager_mut().replace_or_add(MonitorSession {
+        id: target.id.clone(),
+        device: target.device.clone(),
+        cmd_tx,
+        dead: dead.clone(),
+    });
+    spawn_session(target, cmd_rx, events.clone(), dead);
+}
+
+/// Compares the monitors Windows shows with the sessions: a monitor without a (living) session gets one.
+#[cfg(windows)]
+fn rescan(router: &mut Router, events: &async_channel::Sender<SessionEvent>) {
+    let mut changed = false;
+    let targets = enumerate_targets();
+    // A monitor that Windows no longer lists (cable pulled, switched off) leaves the list.
+    for id in router.manager().ids() {
+        if !targets.iter().any(|target| target.id == id) {
+            log!("[WIN] {} is no longer connected", id.label());
+            router.forget(&id);
+            changed = true;
+        }
+    }
+    for target in targets {
+        if router.manager().is_dead(&target.id) == Some(false) {
+            continue;
+        }
+        log!("[WIN] {} ({}) appeared or came back: starting its session", target.id.label(), target.device);
+        start_session(router, target, events);
+        changed = true;
+    }
+    if changed {
+        // The authoritative list of the monitors that exist now.
+        let ids = router.manager().ids();
+        let monitor = ids.first().cloned().unwrap_or_else(system_id);
+        let _ = events.send_blocking(SessionEvent { monitor, cmd: UiCmd::Detected(ids) });
+    }
+}
+
+/// Runs one monitor: connects, then serves its commands. Its events are tagged with the monitor id.
+#[cfg(windows)]
+fn spawn_session(
+    target: SessionTarget,
+    cmd_rx: mpsc::Receiver<WorkerCmd>,
+    events: async_channel::Sender<SessionEvent>,
+    dead: std::sync::Arc<AtomicBool>,
+) {
+    let (ui_tx, ui_rx) = async_channel::unbounded::<UiCmd>();
+    let id = target.id.clone();
+    thread::spawn(move || forward_tagged(id, ui_rx, events, Some(dead)));
+    thread::spawn(move || {
+        let _timer = crate::platform::windows::TimerResolution::new();
+        let key = target.id.cache_key();
+        let Some((ddc, info, table_read)) = try_connect(&target.device, &target.id.name, &key, Some(&target.drm), &ui_tx)
+        else {
+            log!("[DDC] {}: could not connect", target.id.label());
+            let _ = ui_tx.send_blocking(UiCmd::Error("Monitor not found".into()));
+            return;
+        };
+        let _ = ui_tx.send_blocking(UiCmd::MonitorFound(info));
+        Worker::new(ddc, key, ui_tx, table_read).run(&cmd_rx);
+    });
+}
+
+#[cfg(unix)]
+fn start_worker_hw(worker_rx: mpsc::Receiver<WorkerCmd>, ui_tx: async_channel::Sender<UiCmd>) {
     thread::spawn(move || {
         let mut found = None;
         let mut current_monitor_name = None;
@@ -1897,7 +1514,7 @@ pub fn start_worker(worker_rx: mpsc::Receiver<WorkerCmd>, ui_tx: async_channel::
                 .or_else(|| get_edid_name_retry(cached_path, 1));
             if let Some(name) = cached_name {
                 let drm_info = drm_monitors.iter().find(|monitor| monitor.name == name);
-                if let Some((ddc, info, table_read)) = try_connect(cached_path, &name, drm_info, &ui_tx) {
+                if let Some((ddc, info, table_read)) = try_connect(cached_path, &name, &name, drm_info, &ui_tx) {
                     let _ = ui_tx.send_blocking(UiCmd::MonitorFound(info));
                     current_monitor_name = Some(name);
                     found = Some((ddc, table_read));
@@ -1934,7 +1551,7 @@ pub fn start_worker(worker_rx: mpsc::Receiver<WorkerCmd>, ui_tx: async_channel::
             }
 
             let drm_info = drm_monitors.iter().find(|monitor| monitor.name == name);
-            if let Some((ddc, info, table_read)) = try_connect(&p, &name, drm_info, &ui_tx) {
+            if let Some((ddc, info, table_read)) = try_connect(&p, &name, &name, drm_info, &ui_tx) {
                 let _ = ui_tx.send_blocking(UiCmd::MonitorFound(info));
                 current_monitor_name = Some(name.clone());
                 found = Some((ddc, table_read));
@@ -1953,500 +1570,23 @@ pub fn start_worker(worker_rx: mpsc::Receiver<WorkerCmd>, ui_tx: async_channel::
     });
 }
 
-/// Settings that are read from the monitor after connecting. Picture settings of a Custom profile come from the
-/// profile table; they are read one by one for a Default profile or when the table could not be read.
-fn startup_read_keys(table_read: bool) -> Vec<u8> {
-    if table_read {
-        return GLOBAL_SETTING_KEYS.to_vec();
-    }
-    let mut keys = vec![VCP_MODE];
-    keys.extend_from_slice(PROFILE_SETTING_KEYS);
-    keys.extend_from_slice(GLOBAL_SETTING_KEYS);
-    keys
-}
-
-/// Settings of the active picture profile that can be read one by one (Default profiles, failed table reads).
-/// The User 1-3 RGB gains are only in the profile table: 0x17, 0x19, 0x1B-0x1D answer "unsupported" and 0x1E
-/// reads as max 2 (checked on the monitor 2026-10-01).
-const PROFILE_SETTING_KEYS: &[u8] = &[
-    VCP_BRIGHTNESS, VCP_CONTRAST, VCP_SHARPNESS, VCP_COLOR_ENHANCE, VCP_CR_ENHANCE, VCP_SHADOW_BALANCE,
-    VCP_COLOR_TEMP, VCP_HUE_RED, VCP_HUE_GREEN, VCP_HUE_BLUE,
-    VCP_HUE_YELLOW, VCP_HUE_CYAN, VCP_HUE_MAGENTA, VCP_SATURATION_RED, VCP_SATURATION_GREEN,
-    VCP_SATURATION_BLUE, VCP_SATURATION_YELLOW, VCP_SATURATION_CYAN, VCP_SATURATION_MAGENTA, VCP_LOW_BLUE,
-    VCP_HDR, VCP_GAMMA, VCP_SUPER_RES, VCP_NIGHT_VISION, VCP_DYNAMIC_OD,
-];
-
-/// Settings outside the profile table, read from the monitor after connecting.
-const GLOBAL_SETTING_KEYS: &[u8] = &[
-    // Picture (global)
-    // Halo Control is not read: its register does not return the set value (see UNRELIABLE_READBACK);
-    // the slider shows the last value written by the app (cache).
-    VCP_DCR, VCP_LOCAL_DIMMING, VCP_DYDS, VCP_ADAPTIVE_SYNC, VCP_RATIO, VCP_EYESHIELD_REMINDER,
-    // Game Aid
-    VCP_SCREEN_SIZE, VCP_FPS_COUNTER, VCP_FPS_POS, VCP_CROSSHAIR, VCP_CROSSHAIR_SHAPE, VCP_CROSSHAIR_COLOR,
-    VCP_STOPWATCH, VCP_STOPWATCH_TIME, VCP_STOPWATCH_POS, VCP_GAME_TIME, VCP_GAME_TIME_VAL, VCP_GAME_TIME_POS,
-    VCP_MAGNIFIER, VCP_MAGNIFIER_SIZE, VCP_MAGNIFIER_ZOOM, VCP_MAGNIFIER_POS, VCP_HAWKEYE,
-    VCP_HAWKEYE_SIZE, VCP_HAWKEYE_POS, VCP_HAWKEYE_LEVEL,
-    // Inputs, PIP/PBP, USB
-    VCP_INPUT_SOURCE, VCP_INPUT_SELECT, VCP_OUTPUT_RANGE, VCP_PIP_MODE, VCP_PIP_SOURCE, VCP_PIP_POSITION,
-    VCP_PIP_SIZE, VCP_AUDIO_SOURCE, VCP_USB_HUB_SOURCE, VCP_USB_POWER_SLEEP,
-    // Audio
-    VCP_VOLUME, VCP_MUTE,
-    // LED
-    VCP_REAR_LED, VCP_POWER_LED, VCP_LED_MODE, VCP_LED_COLOR, VCP_LED_STRENGTH, VCP_LED_FRONT_COLOR,
-    VCP_LED_REAR_COLOR,
-    // OSD and system
-    VCP_OSD_LANG, VCP_OSD_TIME, VCP_OSD_H_POS, VCP_OSD_V_POS, VCP_OSD_TRANS, VCP_OSD_LOCK, VCP_BUTTON_LOCK,
-    VCP_QUICK_BOOT, VCP_POWER_SAVING,
-];
-
-/// Settings read per worker step, so user commands are not delayed by a long read.
-const READ_CHUNK: usize = 4;
-/// Interval of the OSD change check (`0x02` New control value).
-const OSD_POLL_INTERVAL: Duration = Duration::from_secs(3);
-/// Pause after a reset before its results are read back.
-const RESET_SETTLE: Duration = Duration::from_millis(1500);
-/// Read-backs of one write: the first mismatch resends the value, the last one reports what the monitor keeps.
-const VERIFY_ATTEMPTS: u8 = 3;
-/// Pause before the last read-back of a write.
-const FINAL_VERIFY_DELAY: Duration = Duration::from_millis(1200);
-/// Settings written by the app are not re-read after an OSD-change flag for this long.
-const OWN_WRITE_QUIET: Duration = Duration::from_secs(5);
-/// Settings whose register does not reliably show a written value (the OSD does change): a mismatch is only logged.
-/// Halo Control: after writing 70 (OSD showed it) `46 [99]` read `ff64/0001` (2026-10-01).
-const UNRELIABLE_READBACK: &[u8] = &[VCP_HALO_CONTROL];
-
-/// Background work of the worker. User commands always go first; the UI is never blocked.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Task {
-    /// Read a written setting back; `attempt` counts read-backs of this write.
-    Verify { code: u8, value: u16, attempt: u8 },
-    /// Read the active profile number and its table.
-    RefreshProfile,
-    /// Read settings from the monitor (startup, after a reset or an OSD change).
-    Read(Vec<u8>),
-    /// Tells the UI that the profile settings queued before it have been read.
-    ProfileLoaded,
-    /// Reads the profile table again until two reads agree and corrects the settings if the first read was wrong.
-    ConfirmProfile,
-}
-
-struct Scheduled {
-    task: Task,
-    due: Instant,
-}
-
-struct Worker {
-    ddc: MsiDdc,
-    cache: HashMap<u8, u16>,
-    monitor_name: String,
-    ui_tx: async_channel::Sender<UiCmd>,
-    tasks: VecDeque<Scheduled>,
-    last_poll: Instant,
-    /// When each setting was last written by the app (OSD-change reads of these are skipped for a while).
-    recent_writes: HashMap<u8, Instant>,
-    /// DyDs profiles may be selected with Adaptive-Sync on (firmware 2025-09-20).
-    dyds_with_adaptive_sync: bool,
-}
-
-impl Worker {
-    fn new(
-        ddc: MsiDdc,
-        monitor_name: String,
-        ui_tx: async_channel::Sender<UiCmd>,
-        table_read: bool,
-    ) -> Self {
-        let mut worker = Self {
-            cache: load_cache_for(&monitor_name),
-            ddc,
-            monitor_name,
-            ui_tx,
-            tasks: VecDeque::new(),
-            last_poll: Instant::now(),
-            recent_writes: HashMap::new(),
-            dyds_with_adaptive_sync: false,
-        };
-        worker.queue_reads(&startup_read_keys(table_read), Instant::now());
-        worker
-    }
-
-    fn run(&mut self, worker_rx: &mpsc::Receiver<WorkerCmd>) {
-        loop {
-            // Wait for a command until the next task is due (or the next OSD check when there is no task).
-            let now = Instant::now();
-            let wake = self
-                .tasks
-                .iter()
-                .map(|scheduled| scheduled.due)
-                .min()
-                .unwrap_or(self.last_poll + OSD_POLL_INTERVAL);
-            let wait = wake.saturating_duration_since(now).max(Duration::from_millis(1));
-            match worker_rx.recv_timeout(wait) {
-                Ok(first_cmd) => {
-                    let mut batch = vec![first_cmd];
-                    while let Ok(cmd) = worker_rx.try_recv() {
-                        batch.push(cmd);
-                    }
-                    self.handle_batch(batch);
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Some(task) = self.take_due_task() {
-                        self.run_task(task);
-                    } else if self.tasks.is_empty() && self.last_poll.elapsed() >= OSD_POLL_INTERVAL {
-                        self.poll_osd_changes();
-                        self.last_poll = Instant::now();
-                    }
-                }
-            }
-        }
-    }
-
-    /// First task in queue order whose time has come.
-    fn take_due_task(&mut self) -> Option<Task> {
-        let now = Instant::now();
-        let index = self.tasks.iter().position(|scheduled| scheduled.due <= now)?;
-        self.tasks.remove(index).map(|scheduled| scheduled.task)
-    }
-
-    fn handle_batch(&mut self, batch: Vec<WorkerCmd>) {
-        // The UI stays usable: commands are queued and a newer value of a setting replaces the older one.
-        for cmd in collapse_worker_cmds(batch) {
-            match cmd {
-                WorkerCmd::Set(code, value) => {
-                    self.write(code, value);
-                    // A refused or failed profile change reads nothing: unlock the profile controls at once.
-                    if code == VCP_MODE && !self.tasks.iter().any(|task| task.task == Task::RefreshProfile) {
-                        let _ = self.ui_tx.send_blocking(UiCmd::ProfileLoaded);
-                    }
-                }
-                WorkerCmd::ReadUsageTime => {
-                    if let Some(mins) = read_vcp(&mut self.ddc, VCP_USAGE_TIME) {
-                        update_cached_snapshot_usage_time(&self.monitor_name, mins);
-                        let _ = self.ui_tx.send_blocking(UiCmd::UsageTimeUpdated(mins));
-                    }
-                }
-                WorkerCmd::RefreshAll => {
-                    self.refresh_info();
-                    let now = Instant::now();
-                    self.tasks.retain(|scheduled| !matches!(scheduled.task, Task::Read(_) | Task::RefreshProfile | Task::ConfirmProfile));
-                    self.tasks.push_front(Scheduled { task: Task::RefreshProfile, due: now });
-                    self.queue_reads(GLOBAL_SETTING_KEYS, now);
-                }
-                WorkerCmd::DydsWithAdaptiveSync(allowed) => self.dyds_with_adaptive_sync = allowed,
-            }
-        }
-        // Our own writes may raise the OSD change flag; check it only after the monitor is quiet again.
-        self.last_poll = Instant::now();
-    }
-
-    /// Switches Adaptive-Sync off and confirms it (a prerequisite of `feature`); false = the feature write is cancelled.
-    fn adaptive_sync_off(&mut self, feature: &str) -> bool {
-        match self.ddc.set_vcp(VCP_ADAPTIVE_SYNC, 0) {
-            Ok(None) => {
-                self.recent_writes.insert(VCP_ADAPTIVE_SYNC, Instant::now());
-                self.store(HashMap::from([(VCP_ADAPTIVE_SYNC, 0)]));
-                true
-            }
-            Ok(Some(actual)) => {
-                log!("[DDC] Adaptive Sync stays {actual}; {feature} change cancelled");
-                self.store(HashMap::from([(VCP_ADAPTIVE_SYNC, actual)]));
-                false
-            }
-            Err(error) => {
-                log!("[DDC] Cannot disable Adaptive Sync; {feature} change cancelled: {error}");
-                false
-            }
-        }
-    }
-
-    /// Reads the refresh rate and usage time again and sends them to the UI.
-    fn refresh_info(&mut self) {
-        let hz = read_vcp(&mut self.ddc, VCP_REFRESH_RATE).map(|v| v / 100);
-        let usage_mins = read_vcp(&mut self.ddc, VCP_USAGE_TIME);
-        if let Some(mins) = usage_mins {
-            update_cached_snapshot_usage_time(&self.monitor_name, mins);
-        }
-        let _ = self.ui_tx.send_blocking(UiCmd::InfoRefreshed { hz, usage_mins });
-    }
-
-    /// Sends a write and schedules its read-back.
-    fn write(&mut self, code: u8, value: u16) {
-        // A newer value replaces the one still waiting for its read-back (and a newer profile its table read).
-        self.tasks.retain(|scheduled| match scheduled.task {
-            Task::Verify { code: pending, .. } => pending != code,
-            Task::RefreshProfile | Task::ConfirmProfile => code != VCP_MODE,
-            Task::Read(_) | Task::ProfileLoaded => true,
-        });
-
-        // DyDs profiles need Adaptive-Sync off on firmware older than 2025-09-20; this one is confirmed before the
-        // profile is written, after queue coalescing, so tray/default/custom paths all use the same order.
-        if code == VCP_MODE
-            && (0x1b..=0x1e).contains(&value)
-            && !self.dyds_with_adaptive_sync
-            && !self.adaptive_sync_off("DyDs")
-        {
-            return;
-        }
-
-        if let Err(error) = self.ddc.send_vcp(code, value) {
-            log!("[DDC] VCP 0x{code:02X} error: {error}");
-            return;
-        }
-        self.recent_writes.insert(code, Instant::now());
-        log!("[DDC] write 0x{code:02X} = {value}");
-
-        if is_reset_action(code) {
-            if code == VCP_RESET_FACTORY || code == VCP_VENDOR_FACTORY_RESET {
-                self.cache = factory_reset_defaults();
-                apply_color_temp_cache(&self.monitor_name, &mut self.cache);
-                clear_color_temp_profile_cache(&self.monitor_name);
-                save_cache_for(&self.monitor_name, &self.cache, None);
-            }
-            // Read back what the reset really changed, once the monitor has applied it.
-            let due = Instant::now() + RESET_SETTLE;
-            self.tasks.push_front(Scheduled { task: Task::RefreshProfile, due });
-            self.queue_reads(GLOBAL_SETTING_KEYS, due);
-            return;
-        }
-
-        // Optimistic: the value counts as set; the read-back corrects it if the monitor disagrees.
-        self.apply_written(code, value);
-        if code == VCP_MODE {
-            // A profile change loads that profile's picture settings (after the profile write is confirmed).
-            self.tasks.push_front(Scheduled { task: Task::RefreshProfile, due: Instant::now() + VERIFY_DELAY });
-        }
-        // Settings the monitor changes by itself after this one (e.g. DCR turns local dimming off).
-        let dependents = dependent_reads(code);
-        if !dependents.is_empty() {
-            self.tasks.push_front(Scheduled {
-                task: Task::Read(dependents.to_vec()),
-                due: Instant::now() + DEPENDENT_READ_DELAY,
-            });
-        }
-        if is_verifiable(code) {
-            self.tasks.push_front(Scheduled {
-                task: Task::Verify { code, value, attempt: 1 },
-                due: Instant::now() + VERIFY_DELAY,
-            });
-        }
-    }
-
-    /// Updates the cache after a write (also keeps the color-temperature RGB profiles in sync).
-    fn apply_written(&mut self, code: u8, value: u16) {
-        self.cache.insert(code, value);
-        if let Some(cache_code) = cache_rgb_key_for_vcp_code(code) {
-            self.cache.insert(cache_code, value);
-        }
-        if code == VCP_COLOR_TEMP {
-            apply_color_temp_cache(&self.monitor_name, &mut self.cache);
-        }
-        if is_color_temp_rgb_code(code) {
-            persist_active_color_temp_profile(&self.monitor_name, &self.cache, None);
-        }
-        save_cache_for(&self.monitor_name, &self.cache, None);
-    }
-
-    fn run_task(&mut self, task: Task) {
-        match task {
-            Task::Verify { code, value, attempt } => self.verify(code, value, attempt),
-            Task::RefreshProfile => self.refresh_profile(),
-            Task::Read(keys) => self.read_keys(keys),
-            Task::ProfileLoaded => {
-                let _ = self.ui_tx.send_blocking(UiCmd::ProfileLoaded);
-            }
-            Task::ConfirmProfile => {
-                if let Ok(ActiveProfile::Custom(table)) = self.ddc.read_active_profile(TABLE_CONFIRMATIONS) {
-                    let mut settings = table.settings();
-                    settings.insert(VCP_MODE, table.scene_id as u16);
-                    self.store(settings);
-                }
-            }
-        }
-    }
-
-    fn verify(&mut self, code: u8, value: u16, attempt: u8) {
-        match self.ddc.verify_vcp(code, value) {
-            Readback::Confirmed => log!("[DDC] VCP 0x{code:02X} = {value} confirmed"),
-            Readback::Unreadable if attempt < VERIFY_ATTEMPTS => self.schedule_verify(code, value, attempt + 1),
-            Readback::Unreadable => log!("[DDC] VCP 0x{code:02X} = {value} could not be read back"),
-            Readback::Differs(actual) if attempt < VERIFY_ATTEMPTS => {
-                // A single write is sometimes lost: send it again once, then only read.
-                if attempt == 1 {
-                    log!("[DDC] VCP 0x{code:02X} = {value} not confirmed (read {actual}), resending");
-                    if let Err(error) = self.ddc.send_vcp(code, value) {
-                        log!("[DDC] VCP 0x{code:02X} error: {error}");
-                    }
-                }
-                self.schedule_verify(code, value, attempt + 1);
-            }
-            Readback::Differs(actual) if UNRELIABLE_READBACK.contains(&code) => {
-                log!("[DDC] VCP 0x{code:02X} = {value} written, register reads {actual} (read-back ignored)");
-            }
-            Readback::Differs(actual) => {
-                // The monitor rejected or adjusted the value: keep what it reports and show it.
-                log!("[DDC] VCP 0x{code:02X} = {value} not accepted, monitor reports {actual}");
-                self.apply_written(code, actual);
-                let _ = self.ui_tx.send_blocking(UiCmd::Corrected(HashMap::from([(code, actual)])));
-            }
-        }
-    }
-
-    fn schedule_verify(&mut self, code: u8, value: u16, attempt: u8) {
-        // The last read-back waits longer: some settings take a moment before their register follows.
-        let delay = if attempt >= VERIFY_ATTEMPTS { FINAL_VERIFY_DELAY } else { VERIFY_DELAY * 4 };
-        self.tasks.push_front(Scheduled { task: Task::Verify { code, value, attempt }, due: Instant::now() + delay });
-    }
-
-    /// Reads settings from the monitor and sends the ones that could be read to the UI.
-    fn read_keys(&mut self, keys: Vec<u8>) {
-        let mut settings = HashMap::new();
-        for key in keys {
-            // Replies are validated (header, checksum, code), so every value read is real.
-            if let Some(value) = read_vcp(&mut self.ddc, key) {
-                settings.insert(key, value);
-            }
-        }
-        self.store(settings);
-    }
-
-    /// Reads the active profile number and its table (picture settings).
-    /// Reads the active profile. The first valid table is taken at once so the UI is unlocked quickly; a second,
-    /// confirming read follows in the background (`Task::ConfirmProfile`).
-    fn refresh_profile(&mut self) {
-        match self.ddc.read_active_profile(1) {
-            Ok(ActiveProfile::Custom(table)) => {
-                let mut settings = table.settings();
-                settings.insert(VCP_MODE, table.scene_id as u16);
-                self.store(settings);
-                let _ = self.ui_tx.send_blocking(UiCmd::ProfileLoaded);
-                self.tasks.push_back(Scheduled { task: Task::ConfirmProfile, due: Instant::now() });
-            }
-            Ok(ActiveProfile::Default(scene_id)) => {
-                self.store(HashMap::from([(VCP_MODE, scene_id as u16)]));
-                self.read_profile_settings(PROFILE_SETTING_KEYS);
-            }
-            Err(error) => {
-                log!("[DDC] Profile table read failed: {error}; reading settings one by one");
-                let mut keys = vec![VCP_MODE];
-                keys.extend_from_slice(PROFILE_SETTING_KEYS);
-                self.read_profile_settings(&keys);
-            }
-        }
-    }
-
-    /// Reads the profile settings one by one, ahead of everything else in the queue, then tells the UI.
-    fn read_profile_settings(&mut self, keys: &[u8]) {
-        self.tasks.retain(|scheduled| !matches!(scheduled.task, Task::ProfileLoaded));
-        let mut chunks: VecDeque<Scheduled> = keys
-            .chunks(READ_CHUNK)
-            .map(|chunk| Scheduled { task: Task::Read(chunk.to_vec()), due: Instant::now() })
-            .collect();
-        chunks.push_back(Scheduled { task: Task::ProfileLoaded, due: Instant::now() });
-        for task in chunks.into_iter().rev() {
-            self.tasks.push_front(task);
-        }
-    }
-
-    /// Queues reads in chunks at the end of the queue, skipping settings already waiting to be read.
-    fn queue_reads(&mut self, keys: &[u8], due: Instant) {
-        let queued: HashSet<u8> = self
-            .tasks
-            .iter()
-            .filter_map(|scheduled| match &scheduled.task {
-                Task::Read(keys) => Some(keys.clone()),
-                _ => None,
-            })
-            .flatten()
-            .collect();
-        let missing: Vec<u8> = keys.iter().copied().filter(|key| !queued.contains(key)).collect();
-        for chunk in missing.chunks(READ_CHUNK) {
-            self.tasks.push_back(Scheduled { task: Task::Read(chunk.to_vec()), due });
-        }
-    }
-
-    /// Updates the cache and the UI.
-    fn store(&mut self, mut settings: HashMap<u8, u16>) {
-        if settings.is_empty() {
-            return;
-        }
-        if settings.contains_key(&VCP_COLOR_TEMP) {
-            apply_color_temp_cache(&self.monitor_name, &mut settings);
-        }
-        self.cache.extend(settings.iter().map(|(&code, &value)| (code, value)));
-        save_cache_for(&self.monitor_name, &self.cache, None);
-        let _ = self.ui_tx.send_blocking(UiCmd::Settings(settings));
-    }
-
-    /// Detects settings changed with the monitor buttons: `0x02` = 2 means "changed in the OSD" and the plain
-    /// register of `0x52` names the last changed code. Writing `0x02 = 1` clears both. Manufacturer settings
-    /// do not always appear in `0x52`; an unknown code triggers a full read.
-    fn poll_osd_changes(&mut self) {
-        let Ok(flag) = self.ddc.get_vcp(VCP_NEW_CONTROL_VALUE) else {
-            return;
-        };
-        if flag != 2 {
-            return;
-        }
-        let changed = self.ddc.get_active_control().ok();
-        if let Err(error) = self.ddc.send_vcp(VCP_NEW_CONTROL_VALUE, 1) {
-            log!("[DDC] Cannot clear the OSD change flag: {error}");
-        }
-        log!("[DDC] Setting changed in the OSD: {changed:02X?}");
-        let now = Instant::now();
-        // Our own writes also raise the flag; reading such a setting back could show a lagging register value.
-        if let Some(code) = changed
-            && self.recent_writes.get(&code).is_some_and(|at| at.elapsed() < OWN_WRITE_QUIET)
-        {
-            return;
-        }
-        match changed {
-            Some(VCP_MODE) => self.tasks.push_back(Scheduled { task: Task::RefreshProfile, due: now }),
-            Some(code) if PROFILE_SETTING_KEYS.contains(&code) || GLOBAL_SETTING_KEYS.contains(&code) => {
-                self.queue_reads(&[code], now);
-            }
-            _ => {
-                self.tasks.push_back(Scheduled { task: Task::RefreshProfile, due: now });
-                self.queue_reads(GLOBAL_SETTING_KEYS, now);
-            }
-        }
-    }
-}
-
-/// Pause before settings that depend on a write are read back.
-const DEPENDENT_READ_DELAY: Duration = Duration::from_millis(800);
-
-/// Settings the monitor may change by itself after a write of `code` (OSD rules, observed in the old UI logic).
-fn dependent_reads(code: u8) -> &'static [u8] {
-    match code {
-        VCP_SCREEN_SIZE => &[VCP_ADAPTIVE_SYNC, VCP_DYDS, VCP_DYNAMIC_OD, VCP_MAGNIFIER, VCP_HAWKEYE],
-        VCP_ADAPTIVE_SYNC => &[VCP_DYDS, VCP_MAGNIFIER, VCP_HAWKEYE],
-        VCP_DYDS => &[VCP_LOCAL_DIMMING, VCP_DCR, VCP_ADAPTIVE_SYNC],
-        VCP_LOCAL_DIMMING => &[VCP_DCR],
-        // Firmware 2025-09-20: HDR on sets local dimming to High and locks brightness, contrast and DCR.
-        VCP_HDR => &[VCP_LOCAL_DIMMING, VCP_DCR, VCP_BRIGHTNESS, VCP_CONTRAST],
-        VCP_DCR => &[VCP_BRIGHTNESS, VCP_CONTRAST, VCP_LOCAL_DIMMING],
-        VCP_MAGNIFIER => &[VCP_HAWKEYE],
-        VCP_HAWKEYE => &[VCP_MAGNIFIER],
-        VCP_LED_MODE => &[VCP_LED_COLOR, VCP_LED_STRENGTH, VCP_LED_FRONT_COLOR, VCP_LED_REAR_COLOR],
-        VCP_PIP_MODE => &[
-            VCP_PIP_SOURCE, VCP_PIP_POSITION, VCP_PIP_SIZE, VCP_AUDIO_SOURCE, VCP_DCR, VCP_HDR, VCP_ADAPTIVE_SYNC,
-            VCP_DYDS, VCP_DYNAMIC_OD, VCP_FPS_COUNTER, VCP_CROSSHAIR, VCP_STOPWATCH,
-            VCP_GAME_TIME, VCP_MAGNIFIER, VCP_HAWKEYE,
-        ],
-        VCP_PIP_SWAP => &[VCP_PIP_SOURCE, VCP_INPUT_SELECT, VCP_AUDIO_SOURCE],
-        _ => &[],
-    }
-}
-
-/// Writes after which the monitor changes several settings at once.
-fn is_reset_action(code: u8) -> bool {
-    RESET_CODES.contains(&code) || code == VCP_VENDOR_FACTORY_RESET || code == VCP_PIP_RESET
-}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn dummy_info() -> MonitorInfo {
+        MonitorInfo {
+            name: "P275MV PLUS".into(),
+            connector: "DISPLAY1".into(),
+            resolution: "2560x1440".into(),
+            hz: 144,
+            firm: "v 5.1.1".into(),
+            usage_mins: 0,
+            settings: HashMap::new(),
+        }
+    }
+
 
     #[test]
     fn color_enhance_sets_the_saturation() {
@@ -2542,10 +1682,18 @@ mod tests {
         assert!(PICTURE_MODE_DEFAULT_VALUES.iter().all(|&value| value != 0));
     }
 
+    /// Target of the hardware tests: `TITAN_DDC_TARGET`, else `TITAN_I2C`, else a default for the platform.
+    fn hardware_target() -> String {
+        std::env::var("TITAN_DDC_TARGET")
+            .or_else(|_| std::env::var("TITAN_I2C"))
+            .unwrap_or_else(|_| if cfg!(windows) { r"\\.\DISPLAY6".into() } else { "/dev/i2c-14".into() })
+    }
+
     /// Hardware test that WRITES: brightness and OSD H-position are changed by 1 and restored.
     /// Measures how long the monitor needs before a read returns the written value (basis for `VERIFY_DELAY`).
     /// `TITAN_I2C=/dev/i2c-14 cargo test write_readback_delay -- --ignored --nocapture`
     #[test]
+    #[cfg(unix)]
     #[ignore]
     fn write_readback_delay() {
         let path = std::env::var("TITAN_I2C").unwrap_or_else(|_| "/dev/i2c-14".into());
@@ -2571,12 +1719,12 @@ mod tests {
         }
     }
 
-    /// Hardware test, reads only: `TITAN_I2C=/dev/i2c-14 cargo test reads_all_settings -- --ignored --nocapture`.
+    /// Hardware test, reads only. The target is `TITAN_DDC_TARGET` (`/dev/i2c-14` on Linux, `\\.\DISPLAY6` on Windows;
+    /// `TITAN_I2C` still works on Linux): `TITAN_DDC_TARGET=... cargo test reads_all_settings -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn reads_all_settings() {
-        let path = std::env::var("TITAN_I2C").unwrap_or_else(|_| "/dev/i2c-14".into());
-        let mut ddc = MsiDdc::open(&path).expect("open i2c device");
+        let mut ddc = open_ddc(&hardware_target()).expect("open the DDC/CI connection");
         let mut failed = Vec::new();
         for &key in GLOBAL_SETTING_KEYS.iter().chain(PROFILE_SETTING_KEYS) {
             match ddc.get_vcp(key) {
@@ -2590,12 +1738,11 @@ mod tests {
         assert!(failed.is_empty(), "unreadable: {failed:02X?}");
     }
 
-    /// Hardware test: `TITAN_I2C=/dev/i2c-14 cargo test profile_table -- --ignored --nocapture`.
+    /// Hardware test (reads only): `TITAN_DDC_TARGET=... cargo test profile_table -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn profile_table_reads_are_reliable() {
-        let path = std::env::var("TITAN_I2C").unwrap_or_else(|_| "/dev/i2c-14".into());
-        let mut ddc = MsiDdc::open(&path).expect("open i2c device");
+        let mut ddc = open_ddc(&hardware_target()).expect("open the DDC/CI connection");
         let mut first = None;
         for round in 0..10 {
             let started = Instant::now();
@@ -2613,4 +1760,46 @@ mod tests {
             }
         }
     }
+}
+
+/// Development aid (debug builds): `TITAN_FAKE_MONITORS=2` makes the window believe in that many monitors, without
+/// any hardware access, to check the multi-monitor UI. Commands go nowhere.
+#[cfg(debug_assertions)]
+pub fn fake_monitors(events: &async_channel::Sender<SessionEvent>) -> bool {
+    let Some(count) = std::env::var("TITAN_FAKE_MONITORS").ok().and_then(|v| v.parse::<usize>().ok()) else {
+        return false;
+    };
+    let ids: Vec<MonitorId> = (0..count)
+        .map(|i| MonitorId {
+            name: "P275MV PLUS".into(),
+            edid_id: "LHC907D".into(),
+            serial: "0000000000000".into(),
+            path: format!("LHC907D{}FAKE{}", '\\', i + 1),
+        })
+        .collect();
+    let events = events.clone();
+    thread::spawn(move || {
+        let send = |monitor: &MonitorId, cmd: UiCmd| {
+            let _ = events.send_blocking(SessionEvent { monitor: monitor.clone(), cmd });
+        };
+        send(&ids[0], UiCmd::Detected(ids.clone()));
+        for (index, id) in ids.iter().enumerate() {
+            thread::sleep(Duration::from_millis(200 + 100 * index as u64));
+            let brightness = 30 + 50 * index as u16;
+            let settings = HashMap::from([(VCP_BRIGHTNESS, brightness), (VCP_CONTRAST, 40 + index as u16), (VCP_MODE, 0x1A)]);
+            send(
+                id,
+                UiCmd::MonitorFound(MonitorInfo {
+                    name: id.name.clone(),
+                    connector: format!("{0}{0}.{0}DISPLAY{1}", '\\', index + 6),
+                    resolution: "2560x1440".into(),
+                    hz: 144,
+                    firm: "v 5.1.1".into(),
+                    usage_mins: 100 * (index as u16 + 1),
+                    settings,
+                }),
+            );
+        }
+    });
+    true
 }
