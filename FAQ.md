@@ -163,14 +163,13 @@ checks every frame itself and hides the raw bytes, so a reply the monitor sends 
 retried. A cable pulled or a monitor switched off is noticed at once (display-change messages of Windows) and the
 monitor returns to the list when it is back.
 
-### Why does the app start read-only, and what are the write levels?
+### Is writing to the monitor safe?
 
-Titan Control changes settings that live in the monitor's own memory. To keep a mistake cheap, writing is **off at
-every start** and is switched on in *Information → Writing to the monitors* (a warning dialog). Then a level is chosen,
-and each higher level needs its own confirmation: **1** brightness, contrast, volume; **2** the other picture
-settings; **3** game aids, PIP, LED, OSD, inputs and system settings. The settings that can lock or switch off the
-monitor (the resets, button lock `CA`, `D6` power modes, `22 = 0`, `F0`, black level `6C/6E/70`, `C7 = 0`) are never
-written from the window. The tray menu has *Stop writing (read-only)* for an immediate stop.
+Titan Control changes settings that live in the monitor's own memory. Writing is on from the start, as in the Linux
+version. Every write goes to exactly one monitor (the identity of the handle is checked before the first write of a
+connection) and is read back and corrected. `22 = 0` and `F0` (which can switch the monitor off) are never written;
+everything else the window offers is written, also the resets, so confirm those only when you mean them. The first
+Windows build had a read-only start and write levels; they were removed in 1.1.0.
 
 ### Brightness and contrast are greyed out, or a value is "not accepted"
 
@@ -197,7 +196,7 @@ port.
 
 A monitor has its physical power button and a factory reset in the OSD. Button lock (`CA = 1`, buttons 2 and 3) is
 undone with `CA = 2`; `D6 = 5` keeps the monitor off until a button is pressed. Titan Control does not send any of
-these on its own. Keep a note (or photo) of your OSD settings before you try a new write level.
+these on its own. Keep a note (or photo) of your OSD settings before you try new settings.
 
 ### "Monitor not found" on Windows
 

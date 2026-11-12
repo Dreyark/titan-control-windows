@@ -1,8 +1,8 @@
 ; Inno Setup script of the Windows installer. Built by CI (.github/workflows/windows.yml) from the portable package:
-;   iscc /DVersion=1.0.1 packaging\windows\titan_control.iss
+;   iscc /DVersion=1.1.0 packaging\windows\titan_control.iss
 ; The package folder (dist\TitanControl-<version>-windows-x64) is made by scripts/package_windows.sh.
 #ifndef Version
-  #define Version "1.0.1"
+  #define Version "1.1.0"
 #endif
 #define PackageDir "..\..\dist\TitanControl-" + Version + "-windows-x64"
 

@@ -1094,10 +1094,15 @@ fn open_ddc(path: &str) -> io::Result<MsiDdc> {
     let transport = crate::platform::windows::open_transport(path)?;
     // One lock for the whole bus: exchanges of different monitors never interleave.
     let mut ddc = MsiDdc::new(Box::new(transport::BusLocked::new(transport, transport::global_bus())));
-    // Writes follow the level chosen in the window (0 = read-only at every start), and never the advanced
-    // write level (resets and the like).
-    ddc.set_level_source(user_write_level_source());
-    ddc.set_write_level(WriteLevel::Normal);
+    if WRITE_LEVELS_ENABLED {
+        // Writes follow the level chosen in the window (0 = read-only at every start), and never the advanced
+        // write level (resets and the like).
+        ddc.set_level_source(user_write_level_source());
+        ddc.set_write_level(WriteLevel::Normal);
+    } else {
+        // As on Linux: every write the window offers, including the reset buttons; `22 = 0` and `F0` stay blocked.
+        ddc.set_write_level(WriteLevel::Advanced);
+    }
     // The first write after connecting checks that the handle still belongs to the same monitor.
     let path = path.to_string();
     let expected = crate::platform::windows::current_identity(&path).map_err(io::Error::other)?;
@@ -1239,10 +1244,12 @@ fn system_id() -> MonitorId {
     MonitorId::legacy("monitor")
 }
 
-/// Windows: writes follow a level the user chooses in the window (0 = read-only, the default at every start). Linux has
-/// never had such a limit.
+/// Windows write levels (read-only at every start, a consent and a level chosen in the window, an allowlist per level)
+/// are built but switched off: writes behave as on Linux. Set to `true` to bring the levels back.
+pub const WRITE_LEVELS_ENABLED: bool = false;
+
 pub fn write_policy_active() -> bool {
-    cfg!(windows)
+    cfg!(windows) && WRITE_LEVELS_ENABLED
 }
 
 /// The write level shared by the window and every session. Changing it takes effect at the next write attempt, so
@@ -1262,11 +1269,11 @@ pub fn user_write_level() -> u8 {
 }
 
 /// Whether a write of `code` is allowed at `level` (see [`write_class`]).
-/// Experimental (Windows, write level 2+): the settings of a Default profile are offered for writing as well. The
-/// monitor keeps factory values there per its documentation, so such a write may be ignored; read-back shows what
-/// really happened.
+/// Windows: the settings of a Default profile are offered for writing as well (the monitors of the author only report
+/// Default profiles). The monitor may ignore such a write per its documentation; the read-back shows what really
+/// happened and puts the real value back in the control.
 pub fn default_profile_unlocked() -> bool {
-    write_policy_active() && user_write_level() >= 2
+    cfg!(windows) && (!WRITE_LEVELS_ENABLED || user_write_level() >= 2)
 }
 
 pub fn write_allowed(code: u8, level: u8) -> bool {

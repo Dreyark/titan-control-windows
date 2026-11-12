@@ -1,6 +1,6 @@
 # Smoke test of a Windows package on a machine that has no GTK: starts the packaged executable with a clean PATH
 # (only the Windows folders, no MSYS2) in safe mode (--no-ddc: no monitor is touched) and checks its log.
-#   .\scripts\smoke_windows.ps1 -Dir dist\TitanControl-1.0.1-windows-x64
+#   .\scripts\smoke_windows.ps1 -Dir dist\TitanControl-1.1.0-windows-x64
 param([Parameter(Mandatory = $true)][string]$Dir)
 $ErrorActionPreference = 'Stop'
 $exe = Join-Path (Resolve-Path $Dir) 'bin\titan_control.exe'

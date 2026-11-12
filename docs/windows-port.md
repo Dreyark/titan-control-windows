@@ -18,7 +18,7 @@ This page explains how the port is built, what was checked on real hardware and 
         │
         ▼
  MsiDdc (protocol: pacing, retries, settle, vendor registers, table)   src/monitor/ddc.rs
-        │   write level / identity check / dangerous-write guard
+        │   identity check / dangerous-write guard
         ▼
  VcpTransport (one frame per call)                                     src/monitor/transport.rs
    ├─ LinuxI2c   raw I²C (`/dev/i2c-*`)        src/platform/linux.rs
@@ -39,11 +39,10 @@ differs. On Linux a single session is started by the old code path, so its behav
   is migrated only when the name is unambiguous. Every write goes to exactly one session, and before the first write of
   a connection the handle's identity is checked again (a renumbered `\\.\DISPLAYn` blocks the write).
 - **One bus lock** serialises single exchanges of different monitors; each monitor keeps its own request pacing.
-- **Safety.** The program starts read-only. Writes need an explicit consent in the window and a *write level*
-  (1 brightness, contrast, volume; 2 the other picture settings; 3 game aids, PIP, LED, OSD, inputs); each higher level
-  needs its own confirmation. The settings that can lock or switch off the monitor (resets, button lock, power modes,
-  black level, `22 = 0`) are blocked at every level and not offered in the window. Level 0 is an immediate stop (the
-  level is shared with all sessions and read at every write), also from the tray menu.
+- **Safety.** Writing is on from the start, as on Linux. Before the first write of a connection the handle's identity
+  is checked, every write is read back, and `22 = 0` and `F0` are blocked (the other dangerous settings, e.g. resets, are
+  written when the window offers them, as on Linux). The first Windows build had a read-only start with write levels 0-3 (consent per level, a stop
+  switch); they were removed in 1.1.0 (`WRITE_LEVELS_ENABLED` in `src/monitor.rs` switches the code back on).
 - **Hotplug.** A hidden window receives `WM_DISPLAYCHANGE`, `WM_DEVICECHANGE` and resume messages (plus a periodic
   scan); a monitor that appears or comes back gets a new session, one that disappears leaves the list.
 - **DPI.** GTK 4 on Windows is DPI aware (sharp text) but scales only fonts, not widgets. The window therefore opens

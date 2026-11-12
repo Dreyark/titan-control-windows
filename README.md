@@ -11,7 +11,7 @@ Built with Rust, GTK 4 and libadwaita. It is not affiliated with Titan Army.
 > This is an independent version, maintained separately by [Dreyark](https://github.com/Dreyark), of [mkarenko/titan-control](https://github.com/mkarenko/titan-control),
 > the original Linux app by **mkarenko** (MIT license; the original copyright notice is kept in [LICENSE](LICENSE)).
 > It adds **Windows 10/11 support** (DDC/CI through the Windows Monitor Configuration API), two monitors in one window,
-> write levels, a tray and a Windows installer; see [docs/windows-port.md](docs/windows-port.md) and the
+> a tray and a Windows installer; see [docs/windows-port.md](docs/windows-port.md) and the
 > [CHANGELOG](CHANGELOG.md). It is a separate project: changes here are not sent to the original repository, and
 > the original author is not responsible for them. The protocol work, the monitor documentation and the Linux
 > version are his.
@@ -122,11 +122,9 @@ of the [Windows workflow](.github/workflows/windows.yml). The ZIP needs no insta
 `bin\titan_control.exe`. The program talks to the monitor through the Windows Monitor Configuration API (DDC/CI), so
 no driver, no administrator rights and no extra software are needed.
 
-- **Read-only at every start.** Writing to the monitors is off until you switch it on (*Information → Writing to the
-  monitors*). Settings are saved in the monitor's memory, so the app asks first and raises the *write level* one step at
-  a time: 1 brightness, contrast, volume; 2 the other picture settings; 3 game aids, PIP, LED, OSD, inputs. Resets and
-  the settings that can lock the monitor are never written. Switching writing off (in the window or in the tray menu)
-  stops it at once.
+- **Writing works from the first start**, as in the Linux version. Every write goes to the selected monitor only, is
+  read back and corrected, and checks that the handle still belongs to the same monitor. `22 = 0` and `F0` (which can
+  switch the monitor off) are never written; the rest behaves as on Linux, so use the reset buttons with care.
 - **Two identical monitors** are told apart by their Windows device path; give them aliases (*Information*) and use
   *Identify monitors* to see which is which. Every write goes to the one monitor that is selected.
 - **Tray, autostart, one instance.** Closing the window hides it to the tray; *Auto start* adds a logon entry that

@@ -4,8 +4,8 @@
 1 RT_MANIFEST "titan_control.manifest"
 
 1 VERSIONINFO
-FILEVERSION 1,0,1,0
-PRODUCTVERSION 1,0,1,0
+FILEVERSION 1,1,0,0
+PRODUCTVERSION 1,1,0,0
 FILEFLAGSMASK 0x3fL
 FILEOS 0x40004L
 FILETYPE 0x1L
@@ -16,8 +16,8 @@ BEGIN
     BEGIN
       VALUE "FileDescription", "Titan Control"
       VALUE "ProductName", "Titan Control"
-      VALUE "FileVersion", "1.0.1"
-      VALUE "ProductVersion", "1.0.1"
+      VALUE "FileVersion", "1.1.0"
+      VALUE "ProductVersion", "1.1.0"
       VALUE "OriginalFilename", "titan_control.exe"
       VALUE "LegalCopyright", "MIT License"
     END

@@ -58,12 +58,12 @@ The installer is made from the same folder with [Inno Setup](https://jrsoftware.
 ## 4. Tests
 
 ```sh
-cargo test             # no hardware: protocol on a simulated monitor, sessions, identity, cache, write levels
+cargo test             # no hardware: protocol on a simulated monitor, sessions, identity, cache
 cargo clippy --all-targets
 ```
 
 Development aids (debug builds only): `TITAN_FAKE_MONITORS=2` shows two simulated monitors without touching hardware,
-and with `TITAN_FAKE_SELFTEST=1` the window checks switching, write levels and "identify" and quits (`[SELFTEST]` in
+and with `TITAN_FAKE_SELFTEST=1` the window checks switching, writes and "identify" and quits (`[SELFTEST]` in
 the log). Hardware tests (`#[ignore]`, they read from a real monitor) take the target from `TITAN_DDC_TARGET`:
 `\.\DISPLAY6` on Windows, `/dev/i2c-14` on Linux (`TITAN_I2C` still works on Linux), for example
 `TITAN_DDC_TARGET=\.\DISPLAY6 cargo test reads_all_settings -- --ignored --nocapture`.
@@ -74,7 +74,7 @@ the log). Hardware tests (`#[ignore]`, they read from a real monitor) take the t
 |---|---|
 | `src/platform/windows.rs` | display enumeration, EDID, Dxva2 transport, display change watcher, display modes, HDR, autostart, single instance |
 | `src/monitor/` | protocol (`ddc`), per-monitor worker, sessions, identity, cache, simulated monitor (tests) |
-| `src/multi.rs` | several monitors in the window, write levels, display settings rows |
+| `src/multi.rs` | several monitors in the window, display settings rows |
 | `src/tray_windows.rs` | the tray (`tray-icon`) |
 | `assets/windows/` | icon, version info and the manifest (no DPI awareness on purpose, see the FAQ) embedded by `build.rs` |
 | `tools/ddc_probe/` | stand-alone read-only probe of the Dxva2 transport |

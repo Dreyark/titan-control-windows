@@ -748,8 +748,13 @@ pub fn selftest(a: &Rc<App>, app: &adw::Application) {
             check("active monitor changed", a2.monitors.active() != first_clone(&first));
             check("controls show the other monitor (brightness 80)", a2.bindings.get(monitor::VCP_BRIGHTNESS) == Some(80));
             check("title shows the monitor", !a2.ui.get::<gtk4::Label>("ov_monitor_title").label().is_empty());
-            let scale_ok = a2.ui.scales.first().is_some_and(|scale| scale.is_sensitive() != a2.monitors.is_read_only());
-            check("sliders greyed out in read-only mode", scale_ok || !a2.monitors.is_read_only());
+            if monitor::write_policy_active() {
+                let scale_ok = a2.ui.scales.first().is_some_and(|scale| scale.is_sensitive() != a2.monitors.is_read_only());
+                check("sliders greyed out in read-only mode", scale_ok || !a2.monitors.is_read_only());
+            } else {
+                // Writing is on from the start: a slider of a Custom profile is usable.
+                check("sliders are not greyed out", a2.bindings.is_sensitive(monitor::VCP_BRIGHTNESS));
+            }
             // Alias.
             if let Some(id) = a2.monitors.active() {
                 a2.cfg.borrow_mut().monitor_aliases.insert(id.cache_key(), "Prawy".into());
