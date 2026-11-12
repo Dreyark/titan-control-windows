@@ -1,11 +1,9 @@
-# Builds the release files when a version tag (v1.2.3) is pushed and publishes them as a GitHub release:
-#   tar.gz, deb and AppImage (Debian 13), rpm (Fedora). The tag must match the version in Cargo.toml.
-# Run it by hand from the Actions tab to build the files without publishing them (they are kept as artifacts).
+# Linux release files (tar.gz, deb and AppImage on Debian 13, rpm on Fedora), from the original project.
+# In this repository the Linux code is not verified (see the README), so this workflow runs only by hand from the
+# Actions tab (the files are kept as artifacts). Windows releases are made by windows.yml when a version tag is pushed.
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
 
 permissions:

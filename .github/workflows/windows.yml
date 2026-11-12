@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write   # a release is created when a version tag is pushed
 
 jobs:
   windows:
@@ -75,3 +75,24 @@ jobs:
             dist/*.zip
             dist/*-setup.exe
           retention-days: 30
+
+      - name: Publish a GitHub release (version tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $files = @(Get-ChildItem dist -File | Where-Object { $_.Name -like '*.zip' -or $_.Name -like '*-setup.exe' } | ForEach-Object { $_.FullName })
+          $notes = @"
+          Windows 10/11 (x64) build of Titan Control.
+
+          - **TitanControl-*-setup.exe**: installer (per user, no administrator rights needed).
+          - **TitanControl-*-windows-x64.zip**: portable, unpack and run ``bin\titan_control.exe``.
+
+          The files are not code-signed, so Windows SmartScreen may warn you ("More info" → "Run anyway").
+          The program starts read-only; read the [README](https://github.com/${{ github.repository }}#windows-10-and-11-x64) and the
+          [FAQ](https://github.com/${{ github.repository }}/blob/main/FAQ.md#windows-questions) before you enable writing.
+          "@
+          Set-Content -Path release-notes.md -Value $notes -Encoding utf8
+          gh release create $tag @files --title "Titan Control $tag (Windows)" --notes-file release-notes.md --verify-tag
